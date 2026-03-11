@@ -1,0 +1,20 @@
+# Request
+sensor_msgs/Image image
+string[] dictionaries
+float64[] marker_sizes
+float64 fx
+float64 fy
+float64 cx
+float64 cy
+float64 k1
+float64 k2
+float64 p1
+float64 p2
+float64 k3
+uint32 image_width
+uint32 image_height
+---
+# Response
+sensor_msgs/Image visualization_2d
+sensor_msgs/Image visualization_3d
+aruco_msgs/MarkerArray markers

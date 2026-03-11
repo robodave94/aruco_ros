@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Camera Calibration Launch File -->
+    <!-- Calibrate camera intrinsics using a checkerboard pattern from an RGB feed -->
+
+    <arg name="image_topic" default="/camera/image_raw"
+         description="Input RGB image topic"/>
+
+    <arg name="checkerboard_rows" default="6"
+         description="Number of inner corners per row"/>
+
+    <arg name="checkerboard_cols" default="9"
+         description="Number of inner corners per column"/>
+
+    <arg name="square_size" default="0.025"
+         description="Size of each checkerboard square in meters"/>
+
+    <arg name="output_file" default="camera_params.yml"
+         description="Output file path for calibration YAML"/>
+
+    <arg name="num_frames" default="20"
+         description="Number of frames to collect for calibration"/>
+
+    <node pkg="aruco_ros_cv" exec="camera_calibration"
+          name="camera_calibration" output="screen">
+        <param name="image_topic" value="$(var image_topic)"/>
+        <param name="checkerboard_rows" value="$(var checkerboard_rows)"/>
+        <param name="checkerboard_cols" value="$(var checkerboard_cols)"/>
+        <param name="square_size" value="$(var square_size)"/>
+        <param name="output_file" value="$(var output_file)"/>
+        <param name="num_frames" value="$(var num_frames)"/>
+    </node>
+</launch>

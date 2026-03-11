@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- ArUco RT Capture Launch File -->
+    <!-- Real-time ArUco marker detection from an RGB image topic -->
+
+    <arg name="image_topic" default="/camera/image_raw"
+         description="Input RGB image topic"/>
+
+    <arg name="dictionaries" default="['DICT_6X6_250']"
+         description="List of ArUco dictionary names"/>
+
+    <arg name="marker_sizes" default="[0.05]"
+         description="List of marker sizes in meters"/>
+
+    <arg name="fx" default="951.264" description="Focal length x"/>
+    <arg name="fy" default="944.244" description="Focal length y"/>
+    <arg name="cx" default="644.983" description="Principal point x"/>
+    <arg name="cy" default="360.018" description="Principal point y"/>
+    <arg name="k1" default="0.0" description="Radial distortion k1"/>
+    <arg name="k2" default="0.0" description="Radial distortion k2"/>
+    <arg name="p1" default="0.0" description="Tangential distortion p1"/>
+    <arg name="p2" default="0.0" description="Tangential distortion p2"/>
+    <arg name="k3" default="0.0" description="Radial distortion k3"/>
+    <arg name="image_width" default="1280" description="Image width"/>
+    <arg name="image_height" default="720" description="Image height"/>
+
+    <node pkg="aruco_ros_cv" exec="aruco_rt_capture"
+          name="aruco_rt_capture" output="screen">
+        <param name="image_topic" value="$(var image_topic)"/>
+        <param name="dictionaries" value="$(var dictionaries)"/>
+        <param name="marker_sizes" value="$(var marker_sizes)"/>
+        <param name="fx" value="$(var fx)"/>
+        <param name="fy" value="$(var fy)"/>
+        <param name="cx" value="$(var cx)"/>
+        <param name="cy" value="$(var cy)"/>
+        <param name="k1" value="$(var k1)"/>
+        <param name="k2" value="$(var k2)"/>
+        <param name="p1" value="$(var p1)"/>
+        <param name="p2" value="$(var p2)"/>
+        <param name="k3" value="$(var k3)"/>
+        <param name="image_width" value="$(var image_width)"/>
+        <param name="image_height" value="$(var image_height)"/>
+    </node>
+</launch>

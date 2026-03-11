@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Single ArUco Image Detection Launch File -->
+    <!-- Detects ArUco markers in a single image, prints results, saves visualizations -->
+
+    <arg name="image_path"
+         default="$(find-pkg-share aruco_ros_cv)/resources/../../../src/aruco_ros/resources/singleMarkersOriginalExample.jpg"
+         description="Path to input image file"/>
+
+    <arg name="camera_params_file"
+         default="$(find-pkg-share aruco_ros_cv)/resources/camera_params.yml"
+         description="Path to OpenCV YAML camera intrinsics file"/>
+
+    <arg name="dictionaries"
+         default="['DICT_6X6_250']"
+         description="List of ArUco dictionary names"/>
+
+    <arg name="marker_sizes"
+         default="[0.05]"
+         description="List of marker physical sizes in meters"/>
+
+    <arg name="output_dir"
+         default=""
+         description="Directory to save visualizations (default: same as input image)"/>
+
+    <node pkg="aruco_ros_cv" exec="single_aruco_image_detection"
+          name="single_aruco_image_detection" output="screen">
+        <param name="image_path" value="$(var image_path)"/>
+        <param name="camera_params_file" value="$(var camera_params_file)"/>
+        <param name="dictionaries" value="$(var dictionaries)"/>
+        <param name="marker_sizes" value="$(var marker_sizes)"/>
+        <param name="output_dir" value="$(var output_dir)"/>
+    </node>
+</launch>

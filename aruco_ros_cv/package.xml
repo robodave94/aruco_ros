@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>aruco_ros_cv</name>
+  <version>1.0.0</version>
+  <description>ArUco marker detection nodes using OpenCV cv::aruco API</description>
+  <maintainer email="dev@dev.com">dev</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>aruco_msgs</depend>
+  <depend>aruco_ros_cv_interfaces</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>diagnostic_msgs</depend>
+
+  <build_depend>OpenCV</build_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

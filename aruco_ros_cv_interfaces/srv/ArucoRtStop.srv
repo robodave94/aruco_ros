@@ -1,0 +1,6 @@
+# Request
+string image_topic
+---
+# Response
+bool success
+string message
