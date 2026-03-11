@@ -1,6 +1,8 @@
 aruco_ros
 =========
 
+**Need to update readme with my changes**
+
 Software package and ROS wrappers of the [Aruco][1] Augmented Reality marker detector library.
 
 
