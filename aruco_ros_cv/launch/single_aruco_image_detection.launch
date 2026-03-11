@@ -4,7 +4,7 @@
     <!-- Detects ArUco markers in a single image, prints results, saves visualizations -->
 
     <arg name="image_path"
-         default="$(find-pkg-share aruco_ros_cv)/resources/../../../src/aruco_ros/resources/singleMarkersOriginalExample.jpg"
+         default="$(find-pkg-share aruco_ros_cv)/resources/singleMarkersOriginalExample.jpg"
          description="Path to input image file"/>
 
     <arg name="camera_params_file"
