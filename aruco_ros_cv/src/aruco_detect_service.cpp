@@ -16,6 +16,7 @@
 #endif
 
 #include <sensor_msgs/image_encodings.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
 #include "aruco_ros_cv_interfaces/srv/aruco_detect.hpp"
 #include "aruco_msgs/msg/marker.hpp"
 #include "aruco_msgs/msg/marker_array.hpp"
@@ -65,11 +66,10 @@ private:
       }
       cv::Mat image = cv_ptr->image;
 
-      // Build camera intrinsics
-      cv::Mat cam_mtx = aruco_ros_cv::buildCameraMatrix(
-        request->fx, request->fy, request->cx, request->cy);
-      cv::Mat dist = aruco_ros_cv::buildDistCoeffs(
-        request->k1, request->k2, request->p1, request->p2, request->k3);
+      // Build camera intrinsics from CameraInfo
+      const auto & ci = request->camera_info;
+      cv::Mat cam_mtx = aruco_ros_cv::buildCameraMatrix(ci.k[0], ci.k[4], ci.k[2], ci.k[5]);
+      cv::Mat dist = cv::Mat(ci.d, true);
 
       // Detect markers across all dictionaries
       aruco_ros_cv::DetectionResult det = aruco_ros_cv::detectMultiDictMarkers(

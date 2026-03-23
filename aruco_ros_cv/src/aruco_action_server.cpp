@@ -32,6 +32,7 @@
 #endif
 
 #include <sensor_msgs/image_encodings.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
@@ -184,9 +185,9 @@ private:
       ctx->image_topic = goal->image_topic;
       ctx->dictionaries = goal->dictionaries;
       ctx->marker_sizes = goal->marker_sizes;
-      ctx->cam_mtx = aruco_ros_cv::buildCameraMatrix(goal->fx, goal->fy, goal->cx, goal->cy);
-      ctx->dist_coeffs = aruco_ros_cv::buildDistCoeffs(
-        goal->k1, goal->k2, goal->p1, goal->p2, goal->k3);
+      const auto & ci = goal->camera_info;
+      ctx->cam_mtx = aruco_ros_cv::buildCameraMatrix(ci.k[0], ci.k[4], ci.k[2], ci.k[5]);
+      ctx->dist_coeffs = cv::Mat(ci.d, true);
       ctx->last_image_time = std::chrono::steady_clock::now();
 
       // Create publishers

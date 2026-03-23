@@ -25,6 +25,7 @@
 
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/image_encodings.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
 #include "aruco_msgs/msg/marker.hpp"
 #include "aruco_msgs/msg/marker_array.hpp"
 #include "aruco_ros_cv/aruco_cv_utils.hpp"
@@ -39,35 +40,13 @@ public:
     this->declare_parameter<std::string>("image_topic", "/camera/image_raw");
     this->declare_parameter<std::vector<std::string>>("dictionaries", {"DICT_6X6_250"});
     this->declare_parameter<std::vector<double>>("marker_sizes", {0.05});
-    this->declare_parameter<double>("fx", 951.264);
-    this->declare_parameter<double>("fy", 944.244);
-    this->declare_parameter<double>("cx", 644.983);
-    this->declare_parameter<double>("cy", 360.018);
-    this->declare_parameter<double>("k1", 0.0);
-    this->declare_parameter<double>("k2", 0.0);
-    this->declare_parameter<double>("p1", 0.0);
-    this->declare_parameter<double>("p2", 0.0);
-    this->declare_parameter<double>("k3", 0.0);
-    this->declare_parameter<int>("image_width", 1280);
-    this->declare_parameter<int>("image_height", 720);
+    this->declare_parameter<std::string>("camera_info_topic", "/camera/camera_info");
 
     // Get parameters
     image_topic_ = this->get_parameter("image_topic").as_string();
     dictionaries_ = this->get_parameter("dictionaries").as_string_array();
     marker_sizes_ = this->get_parameter("marker_sizes").as_double_array();
-
-    double fx = this->get_parameter("fx").as_double();
-    double fy = this->get_parameter("fy").as_double();
-    double cx = this->get_parameter("cx").as_double();
-    double cy = this->get_parameter("cy").as_double();
-    double k1 = this->get_parameter("k1").as_double();
-    double k2 = this->get_parameter("k2").as_double();
-    double p1 = this->get_parameter("p1").as_double();
-    double p2 = this->get_parameter("p2").as_double();
-    double k3 = this->get_parameter("k3").as_double();
-
-    cam_mtx_ = aruco_ros_cv::buildCameraMatrix(fx, fy, cx, cy);
-    dist_coeffs_ = aruco_ros_cv::buildDistCoeffs(k1, k2, p1, p2, k3);
+    camera_info_topic_ = this->get_parameter("camera_info_topic").as_string();
 
     if (dictionaries_.size() != marker_sizes_.size()) {
       RCLCPP_ERROR(this->get_logger(), "dictionaries and marker_sizes must have equal length");
@@ -96,6 +75,11 @@ public:
       image_topic_, rclcpp::SensorDataQoS(),
       std::bind(&ArucoRtCaptureNode::image_callback, this, std::placeholders::_1));
 
+    // Subscribe to camera info (transient_local to receive latched messages)
+    cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+      camera_info_topic_, rclcpp::QoS(1).transient_local(),
+      std::bind(&ArucoRtCaptureNode::camera_info_callback, this, std::placeholders::_1));
+
     RCLCPP_INFO(this->get_logger(), "ArUco RT capture started");
     RCLCPP_INFO(this->get_logger(), "  Input topic:   %s", image_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "  Feed topic:    %s", feed_topic.c_str());
@@ -108,17 +92,36 @@ public:
 
 private:
   std::string image_topic_;
+  std::string camera_info_topic_;
   std::vector<std::string> dictionaries_;
   std::vector<double> marker_sizes_;
   cv::Mat cam_mtx_;
   cv::Mat dist_coeffs_;
+  bool camera_info_received_ = false;
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_info_sub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr feed_pub_;
   rclcpp::Publisher<aruco_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
 
+  void camera_info_callback(const sensor_msgs::msg::CameraInfo::ConstSharedPtr & msg)
+  {
+    if (camera_info_received_) return;
+    cam_mtx_ = aruco_ros_cv::buildCameraMatrix(msg->k[0], msg->k[4], msg->k[2], msg->k[5]);
+    dist_coeffs_ = cv::Mat(msg->d, true);
+    camera_info_received_ = true;
+    RCLCPP_INFO(this->get_logger(),
+      "Camera intrinsics received from %s (fx=%.2f fy=%.2f cx=%.2f cy=%.2f, D size=%zu)",
+      camera_info_topic_.c_str(), msg->k[0], msg->k[4], msg->k[2], msg->k[5], msg->d.size());
+  }
+
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
   {
+    if (!camera_info_received_) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "Waiting for camera_info on %s", camera_info_topic_.c_str());
+      return;
+    }
     cv_bridge::CvImagePtr cv_ptr;
     try {
       cv_ptr = cv_bridge::toCvCopy(*msg, sensor_msgs::image_encodings::BGR8);
