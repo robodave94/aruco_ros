@@ -100,6 +100,8 @@ private:
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    RCLCPP_INFO(this->get_logger(), "Processing incoming image frame...");
+
     if (calibration_done_) return;
 
     cv_bridge::CvImagePtr cv_ptr;
@@ -176,6 +178,9 @@ private:
 
     calibration_done_ = true;
     RCLCPP_INFO(this->get_logger(), "Calibration node finished. You may shut down.");
+
+    // Node shutdown
+    rclcpp::shutdown();
   }
 };
 

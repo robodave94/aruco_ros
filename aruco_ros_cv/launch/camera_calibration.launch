@@ -13,6 +13,7 @@
          description="Number of inner corners per column"/>
 
     <arg name="square_size" default="0.025"
+    
          description="Size of each checkerboard square in meters"/>
 
     <arg name="output_file" default="camera_params.yml"
