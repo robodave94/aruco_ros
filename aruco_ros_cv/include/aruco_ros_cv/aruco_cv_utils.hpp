@@ -145,8 +145,8 @@ inline bool saveCameraIntrinsicsToYAML(
   if (!fs.isOpened()) {
     return false;
   }
-  fs << "cameraMatrix" << camera_matrix;
-  fs << "distCoeffs" << dist_coeffs;
+  fs << "camera_matrix" << camera_matrix;
+  fs << "dist_coeffs" << dist_coeffs;
   fs.release();
   return true;
 }
