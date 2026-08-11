@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Boots aruco_action_server, exposing ~/start_detection (action) and ~/stop_detection (service) -->
+
+    <arg name="ns" default="" description="Namespace for the action server node"/>
+
+    <arg name="max_processing_threads" default="10"
+         description="Max concurrent per-camera-topic detection threads"/>
+
+    <node pkg="aruco_ros_cv" exec="aruco_action_server"
+          name="aruco_action_server" namespace="$(var ns)" output="screen">
+        <param name="max_processing_threads" value="$(var max_processing_threads)"/>
+    </node>
+</launch>
