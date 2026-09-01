@@ -1,5 +1,6 @@
 # Request
 string image_topic
+string detection_id
 ---
 # Response
 bool success

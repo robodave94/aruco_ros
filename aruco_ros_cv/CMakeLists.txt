@@ -74,6 +74,18 @@ add_aruco_node(camera_calibration
   ${COMMON_DEPS}
 )
 
+# ---- Part 6: Start-detection CLI client node ----
+add_aruco_node(aruco_start_detection
+  src/aruco_start_detection.cpp
+  ${COMMON_DEPS} rclcpp_action aruco_ros_cv_interfaces
+)
+
+# ---- Part 7: Stop-detection CLI client node ----
+add_aruco_node(aruco_stop_detection
+  src/aruco_stop_detection.cpp
+  ${COMMON_DEPS} aruco_ros_cv_interfaces
+)
+
 # ---- Install ----
 install(TARGETS
   aruco_detect_service
@@ -81,6 +93,8 @@ install(TARGETS
   aruco_rt_capture
   aruco_action_server
   camera_calibration
+  aruco_start_detection
+  aruco_stop_detection
   DESTINATION lib/${PROJECT_NAME}
 )
 

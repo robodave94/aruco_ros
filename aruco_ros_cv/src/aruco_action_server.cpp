@@ -1,6 +1,6 @@
 /**
  * @file aruco_action_server.cpp
- * @brief ROS2 action server for dynamic multi-camera ArUco marker detection.
+ * @brief ROS2 action server for dynamic multi-camera, multi-detection ArUco marker detection.
  *
  * Action: ~/start_detection  (ArucoRtStart)  - Start RT detection on a camera topic
  * Service: ~/stop_detection  (ArucoRtStop)   - Stop RT detection on a camera topic
@@ -8,12 +8,16 @@
  *
  * Features:
  *   - Dynamically spawn/stop processing threads per camera topic
+ *   - Multiple detections (different dictionaries/ids) can share one camera topic's
+ *     thread/subscription — only distinct topics count against 'max_processing_threads'
  *   - Max thread limit (default 10, configurable via 'max_processing_threads' param)
- *   - Watchdog: warns if no image received for 60s, then shuts down that thread
- *   - Each thread publishes <topic>/arucofeed and <topic>/arucofeed/markers
+ *   - Watchdog: warns if no image received for 60s, then shuts down that topic's thread
+ *   - Each detection publishes <topic>/arucofeed/<detection_id> and
+ *     <topic>/arucofeed/markers/<detection_id>
  */
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -47,22 +51,59 @@ using ArucoRtStart = aruco_ros_cv_interfaces::action::ArucoRtStart;
 using ArucoRtStop = aruco_ros_cv_interfaces::srv::ArucoRtStop;
 using GoalHandleStart = rclcpp_action::ServerGoalHandle<ArucoRtStart>;
 
-/** Per-topic processing context. */
-struct ProcessingThread
+/** Replace any character unsafe for a ROS topic token with '_'. */
+inline std::string sanitizeToken(const std::string & s)
 {
-  std::string image_topic;
+  std::string out = s;
+  for (auto & c : out) {
+    if (!std::isalnum(static_cast<unsigned char>(c))) {
+      c = '_';
+    }
+  }
+  return out;
+}
+
+/** Resolve the id used to key/name a detection: explicit id, or dictionaries joined by '_'. */
+inline std::string resolveDetectionId(
+  const std::string & requested_id,
+  const std::vector<std::string> & dictionaries)
+{
+  if (!requested_id.empty()) {
+    return sanitizeToken(requested_id);
+  }
+  std::string joined;
+  for (size_t i = 0; i < dictionaries.size(); ++i) {
+    if (i > 0) joined += "_";
+    joined += dictionaries[i];
+  }
+  return sanitizeToken(joined);
+}
+
+/** A single detection running on a camera topic's shared thread. */
+struct DetectionJob
+{
+  std::string detection_id;
   std::vector<std::string> dictionaries;
   std::vector<double> marker_sizes;
   cv::Mat cam_mtx;
   cv::Mat dist_coeffs;
 
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr feed_pub;
   rclcpp::Publisher<aruco_msgs::msg::MarkerArray>::SharedPtr markers_pub;
+};
+
+/** Per-topic processing context — one subscription shared by all of its detection jobs. */
+struct CameraThread
+{
+  std::string image_topic;
+
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub;
 
   std::atomic<bool> active{true};
   std::chrono::steady_clock::time_point last_image_time;
   std::mutex time_mutex;
+
+  std::map<std::string, std::shared_ptr<DetectionJob>> jobs;
 };
 
 class ArucoActionServerNode : public rclcpp::Node
@@ -109,7 +150,7 @@ public:
 private:
   size_t max_threads_;
   std::mutex threads_mutex_;
-  std::map<std::string, std::shared_ptr<ProcessingThread>> threads_;
+  std::map<std::string, std::shared_ptr<CameraThread>> camera_threads_;
 
   rclcpp_action::Server<ArucoRtStart>::SharedPtr action_server_;
   rclcpp::Service<ArucoRtStop>::SharedPtr stop_service_;
@@ -128,26 +169,32 @@ private:
     RCLCPP_INFO(this->get_logger(), "Received start request for topic: %s",
       goal->image_topic.c_str());
 
-    std::lock_guard<std::mutex> lock(threads_mutex_);
-
-    // Check if already running
-    if (threads_.count(goal->image_topic)) {
-      RCLCPP_WARN(this->get_logger(), "Detection already running on topic: %s",
-        goal->image_topic.c_str());
+    // Validate inputs
+    if (goal->dictionaries.empty() ||
+      goal->dictionaries.size() != goal->marker_sizes.size())
+    {
+      RCLCPP_ERROR(this->get_logger(),
+        "dictionaries must be non-empty and have the same length as marker_sizes");
       return rclcpp_action::GoalResponse::REJECT;
     }
 
-    // Check thread limit
-    if (threads_.size() >= max_threads_) {
+    std::string detection_id = resolveDetectionId(goal->detection_id, goal->dictionaries);
+
+    std::lock_guard<std::mutex> lock(threads_mutex_);
+
+    auto it = camera_threads_.find(goal->image_topic);
+    if (it != camera_threads_.end()) {
+      // Topic already has a processing thread — joining it doesn't affect the thread limit.
+      if (it->second->jobs.count(detection_id)) {
+        RCLCPP_WARN(this->get_logger(), "Detection '%s' already running on topic: %s",
+          detection_id.c_str(), goal->image_topic.c_str());
+        return rclcpp_action::GoalResponse::REJECT;
+      }
+    } else if (camera_threads_.size() >= max_threads_) {
+      // This would spawn a brand-new processing thread — enforce the thread limit.
       RCLCPP_ERROR(this->get_logger(),
         "The amount of RGB processing RT limits has been reached (%zu). "
         "Please shutdown a feed before adding another.", max_threads_);
-      return rclcpp_action::GoalResponse::REJECT;
-    }
-
-    // Validate inputs
-    if (goal->dictionaries.size() != goal->marker_sizes.size()) {
-      RCLCPP_ERROR(this->get_logger(), "dictionaries and marker_sizes must have equal length");
       return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -180,56 +227,84 @@ private:
         aruco_ros_cv::dictionaryFromString(d);
       }
 
-      // Create processing thread context
-      auto ctx = std::make_shared<ProcessingThread>();
-      ctx->image_topic = goal->image_topic;
-      ctx->dictionaries = goal->dictionaries;
-      ctx->marker_sizes = goal->marker_sizes;
-      const auto & ci = goal->camera_info;
-      ctx->cam_mtx = aruco_ros_cv::buildCameraMatrix(ci.k[0], ci.k[4], ci.k[2], ci.k[5]);
-      ctx->dist_coeffs = cv::Mat(ci.d, true);
-      ctx->last_image_time = std::chrono::steady_clock::now();
+      std::string detection_id = resolveDetectionId(goal->detection_id, goal->dictionaries);
 
-      // Create publishers
-      std::string feed_topic = goal->image_topic + "/arucofeed";
-      std::string markers_topic = goal->image_topic + "/arucofeed/markers";
-
-      ctx->feed_pub = this->create_publisher<sensor_msgs::msg::Image>(feed_topic, 10);
-      ctx->markers_pub = this->create_publisher<aruco_msgs::msg::MarkerArray>(
-        markers_topic, 10);
-
-      // Create subscriber
-      ctx->image_sub = this->create_subscription<sensor_msgs::msg::Image>(
-        goal->image_topic, rclcpp::SensorDataQoS(),
-        [this, ctx](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
-          process_image(ctx, msg);
-        });
-
-      // Register
+      // Find or create the camera thread for this topic
+      std::shared_ptr<CameraThread> cam;
+      bool created_thread = false;
       {
         std::lock_guard<std::mutex> lock(threads_mutex_);
-        threads_[goal->image_topic] = ctx;
+        auto it = camera_threads_.find(goal->image_topic);
+        if (it != camera_threads_.end()) {
+          cam = it->second;
+          if (cam->jobs.count(detection_id)) {
+            throw std::invalid_argument(
+                    "Detection '" + detection_id + "' already running on topic: " +
+                    goal->image_topic);
+          }
+        } else {
+          if (camera_threads_.size() >= max_threads_) {
+            throw std::invalid_argument(
+                    "Max processing threads (" + std::to_string(max_threads_) + ") reached");
+          }
+          cam = std::make_shared<CameraThread>();
+          cam->image_topic = goal->image_topic;
+          cam->last_image_time = std::chrono::steady_clock::now();
+          created_thread = true;
+        }
+      }
+
+      // Build the new detection job
+      auto job = std::make_shared<DetectionJob>();
+      job->detection_id = detection_id;
+      job->dictionaries = goal->dictionaries;
+      job->marker_sizes = goal->marker_sizes;
+      const auto & ci = goal->camera_info;
+      job->cam_mtx = aruco_ros_cv::buildCameraMatrix(ci.k[0], ci.k[4], ci.k[2], ci.k[5]);
+      job->dist_coeffs = cv::Mat(ci.d, true);
+
+      std::string feed_topic = goal->image_topic + "/arucofeed/" + detection_id;
+      std::string markers_topic = goal->image_topic + "/arucofeed/markers/" + detection_id;
+      job->feed_pub = this->create_publisher<sensor_msgs::msg::Image>(feed_topic, 10);
+      job->markers_pub = this->create_publisher<aruco_msgs::msg::MarkerArray>(
+        markers_topic, 10);
+
+      // Only a brand-new camera thread needs its own subscription
+      if (created_thread) {
+        cam->image_sub = this->create_subscription<sensor_msgs::msg::Image>(
+          goal->image_topic, rclcpp::SensorDataQoS(),
+          [this, cam](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
+            process_image(cam, msg);
+          });
+      }
+
+      // Register
+      size_t active_thread_count;
+      {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        cam->jobs[detection_id] = job;
+        if (created_thread) {
+          camera_threads_[goal->image_topic] = cam;
+        }
+        active_thread_count = camera_threads_.size();
       }
 
       // Send feedback periodically while goal is active
       auto feedback = std::make_shared<ArucoRtStart::Feedback>();
-      feedback->status = "Detection started on " + goal->image_topic;
-
-      {
-        std::lock_guard<std::mutex> lock(threads_mutex_);
-        feedback->active_threads = static_cast<uint32_t>(threads_.size());
-      }
+      feedback->status = "Detection '" + detection_id + "' started on " + goal->image_topic;
+      feedback->active_threads = static_cast<uint32_t>(active_thread_count);
       goal_handle->publish_feedback(feedback);
 
       // Wait briefly then succeed — the thread continues running independently
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
       result->success = true;
-      result->message = "Detection started on " + goal->image_topic;
+      result->detection_id = detection_id;
+      result->message = "Detection '" + detection_id + "' started on " + goal->image_topic;
       goal_handle->succeed(result);
 
-      RCLCPP_INFO(this->get_logger(), "Detection thread started for: %s",
-        goal->image_topic.c_str());
+      RCLCPP_INFO(this->get_logger(), "Detection '%s' started for: %s",
+        detection_id.c_str(), goal->image_topic.c_str());
 
     } catch (const std::exception & e) {
       result->success = false;
@@ -247,23 +322,58 @@ private:
     const std::shared_ptr<ArucoRtStop::Request> request,
     std::shared_ptr<ArucoRtStop::Response> response)
   {
-    RCLCPP_INFO(this->get_logger(), "Stop request for topic: %s", request->image_topic.c_str());
-
     std::lock_guard<std::mutex> lock(threads_mutex_);
-    auto it = threads_.find(request->image_topic);
-    if (it == threads_.end()) {
+    auto it = camera_threads_.find(request->image_topic);
+    if (it == camera_threads_.end()) {
       response->success = false;
       response->message = "No active detection on topic: " + request->image_topic;
       RCLCPP_WARN(this->get_logger(), "%s", response->message.c_str());
       return;
     }
 
-    shutdown_thread(it->second);
-    threads_.erase(it);
+    auto cam = it->second;
+
+    if (request->detection_id.empty()) {
+      // No id given — stop every detection on this topic and tear down its thread.
+      RCLCPP_INFO(this->get_logger(), "Stop request for all detections on topic: %s",
+        request->image_topic.c_str());
+      shutdown_thread(cam);
+      camera_threads_.erase(it);
+      response->success = true;
+      response->message = "All detections stopped on " + request->image_topic;
+      RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Stop request for detection '%s' on topic: %s",
+      request->detection_id.c_str(), request->image_topic.c_str());
+
+    auto job_it = cam->jobs.find(request->detection_id);
+    if (job_it == cam->jobs.end()) {
+      response->success = false;
+      response->message = "No active detection '" + request->detection_id +
+        "' on topic: " + request->image_topic;
+      RCLCPP_WARN(this->get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    job_it->second->feed_pub.reset();
+    job_it->second->markers_pub.reset();
+    cam->jobs.erase(job_it);
 
     response->success = true;
-    response->message = "Detection stopped on " + request->image_topic;
+    response->message = "Detection '" + request->detection_id + "' stopped on " +
+      request->image_topic;
     RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+
+    if (cam->jobs.empty()) {
+      // Last detection on this topic — no reason to keep the subscription alive.
+      shutdown_thread(cam);
+      camera_threads_.erase(it);
+      RCLCPP_INFO(this->get_logger(),
+        "No detections remain on %s — processing thread shut down",
+        request->image_topic.c_str());
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -271,91 +381,105 @@ private:
   // -------------------------------------------------------------------------
 
   void process_image(
-    std::shared_ptr<ProcessingThread> ctx,
+    std::shared_ptr<CameraThread> cam,
     const sensor_msgs::msg::Image::ConstSharedPtr & msg)
   {
-    if (!ctx->active) return;
+    if (!cam->active) return;
 
     // Update last image timestamp
     {
-      std::lock_guard<std::mutex> lock(ctx->time_mutex);
-      ctx->last_image_time = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> lock(cam->time_mutex);
+      cam->last_image_time = std::chrono::steady_clock::now();
     }
+
+    // Snapshot the current jobs so detection/publishing doesn't hold the shared lock
+    std::vector<std::shared_ptr<DetectionJob>> jobs_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(threads_mutex_);
+      jobs_snapshot.reserve(cam->jobs.size());
+      for (const auto & [id, job] : cam->jobs) {
+        jobs_snapshot.push_back(job);
+      }
+    }
+    if (jobs_snapshot.empty()) return;
 
     cv_bridge::CvImagePtr cv_ptr;
     try {
       cv_ptr = cv_bridge::toCvCopy(*msg, sensor_msgs::image_encodings::BGR8);
     } catch (const cv_bridge::Exception & e) {
       RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "cv_bridge exception on %s: %s", ctx->image_topic.c_str(), e.what());
+        "cv_bridge exception on %s: %s", cam->image_topic.c_str(), e.what());
       return;
     }
 
     cv::Mat image = cv_ptr->image;
-    aruco_ros_cv::DetectionResult det;
-    try {
-      det = aruco_ros_cv::detectMultiDictMarkers(
-        image, ctx->dictionaries, ctx->marker_sizes, ctx->cam_mtx, ctx->dist_coeffs);
-    } catch (const std::exception & e) {
-      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "Detection error on %s: %s", ctx->image_topic.c_str(), e.what());
-      return;
-    }
-
     auto stamp = msg->header.stamp;
 
-    // Publish visualized feed
-    if (ctx->feed_pub->get_subscription_count() > 0) {
-      cv::Mat vis = aruco_ros_cv::draw2DVisualization(image, det, ctx->dictionaries);
-      for (const auto & m : det.markers) {
-        float axis_len = static_cast<float>(m.marker_size) * 0.75f;
-        cv::drawFrameAxes(vis, ctx->cam_mtx, ctx->dist_coeffs, m.rvec, m.tvec, axis_len);
+    for (const auto & job : jobs_snapshot) {
+      aruco_ros_cv::DetectionResult det;
+      try {
+        det = aruco_ros_cv::detectMultiDictMarkers(
+          image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "Detection error on %s [%s]: %s", cam->image_topic.c_str(),
+          job->detection_id.c_str(), e.what());
+        continue;
       }
-      cv_bridge::CvImage out;
-      out.header.stamp = stamp;
-      out.header.frame_id = msg->header.frame_id;
-      out.encoding = sensor_msgs::image_encodings::BGR8;
-      out.image = vis;
-      ctx->feed_pub->publish(*out.toImageMsg());
-    }
 
-    // Publish marker array
-    if (ctx->markers_pub->get_subscription_count() > 0) {
-      aruco_msgs::msg::MarkerArray marker_array;
-      marker_array.header.stamp = stamp;
-      marker_array.header.frame_id = msg->header.frame_id;
+      // Publish visualized feed
+      if (job->feed_pub->get_subscription_count() > 0) {
+        cv::Mat vis = aruco_ros_cv::draw2DVisualization(image, det, job->dictionaries);
+        for (const auto & m : det.markers) {
+          float axis_len = static_cast<float>(m.marker_size) * 0.75f;
+          cv::drawFrameAxes(vis, job->cam_mtx, job->dist_coeffs, m.rvec, m.tvec, axis_len);
+        }
+        cv_bridge::CvImage out;
+        out.header.stamp = stamp;
+        out.header.frame_id = msg->header.frame_id;
+        out.encoding = sensor_msgs::image_encodings::BGR8;
+        out.image = vis;
+        job->feed_pub->publish(*out.toImageMsg());
+      }
 
-      for (const auto & m : det.markers) {
-        aruco_msgs::msg::Marker marker_msg;
-        marker_msg.header.stamp = stamp;
-        marker_msg.header.frame_id = msg->header.frame_id;
-        marker_msg.id = static_cast<uint32_t>(m.id);
-        marker_msg.confidence = 1.0;
-        marker_msg.dictionary = m.dictionary_name;
-        marker_msg.marker_size = m.marker_size;
+      // Publish marker array
+      if (job->markers_pub->get_subscription_count() > 0) {
+        aruco_msgs::msg::MarkerArray marker_array;
+        marker_array.header.stamp = stamp;
+        marker_array.header.frame_id = msg->header.frame_id;
 
-        for (const auto & c : m.corners) {
-          geometry_msgs::msg::Point pt;
-          pt.x = static_cast<double>(c.x);
-          pt.y = static_cast<double>(c.y);
-          pt.z = 0.0;
-          marker_msg.corners.push_back(pt);
+        for (const auto & m : det.markers) {
+          aruco_msgs::msg::Marker marker_msg;
+          marker_msg.header.stamp = stamp;
+          marker_msg.header.frame_id = msg->header.frame_id;
+          marker_msg.id = static_cast<uint32_t>(m.id);
+          marker_msg.confidence = 1.0;
+          marker_msg.dictionary = m.dictionary_name;
+          marker_msg.marker_size = m.marker_size;
+
+          for (const auto & c : m.corners) {
+            geometry_msgs::msg::Point pt;
+            pt.x = static_cast<double>(c.x);
+            pt.y = static_cast<double>(c.y);
+            pt.z = 0.0;
+            marker_msg.corners.push_back(pt);
+          }
+
+          double px, py, pz, qx, qy, qz, qw;
+          aruco_ros_cv::rvecTvecToPositionQuat(m.rvec, m.tvec, px, py, pz, qx, qy, qz, qw);
+          marker_msg.pose.pose.position.x = px;
+          marker_msg.pose.pose.position.y = py;
+          marker_msg.pose.pose.position.z = pz;
+          marker_msg.pose.pose.orientation.x = qx;
+          marker_msg.pose.pose.orientation.y = qy;
+          marker_msg.pose.pose.orientation.z = qz;
+          marker_msg.pose.pose.orientation.w = qw;
+
+          marker_array.markers.push_back(marker_msg);
         }
 
-        double px, py, pz, qx, qy, qz, qw;
-        aruco_ros_cv::rvecTvecToPositionQuat(m.rvec, m.tvec, px, py, pz, qx, qy, qz, qw);
-        marker_msg.pose.pose.position.x = px;
-        marker_msg.pose.pose.position.y = py;
-        marker_msg.pose.pose.position.z = pz;
-        marker_msg.pose.pose.orientation.x = qx;
-        marker_msg.pose.pose.orientation.y = qy;
-        marker_msg.pose.pose.orientation.z = qz;
-        marker_msg.pose.pose.orientation.w = qw;
-
-        marker_array.markers.push_back(marker_msg);
+        job->markers_pub->publish(marker_array);
       }
-
-      ctx->markers_pub->publish(marker_array);
     }
   }
 
@@ -373,24 +497,38 @@ private:
 
     std::lock_guard<std::mutex> lock(threads_mutex_);
     status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
-    status.message = "Active detection threads: " + std::to_string(threads_.size()) +
-      "/" + std::to_string(max_threads_);
 
-    diagnostic_msgs::msg::KeyValue kv_count;
-    kv_count.key = "active_threads";
-    kv_count.value = std::to_string(threads_.size());
-    status.values.push_back(kv_count);
+    size_t total_jobs = 0;
+    for (const auto & [topic, cam] : camera_threads_) {
+      total_jobs += cam->jobs.size();
+    }
+
+    status.message = "Active threads: " + std::to_string(camera_threads_.size()) +
+      "/" + std::to_string(max_threads_) + ", active detections: " +
+      std::to_string(total_jobs);
+
+    diagnostic_msgs::msg::KeyValue kv_threads;
+    kv_threads.key = "active_threads";
+    kv_threads.value = std::to_string(camera_threads_.size());
+    status.values.push_back(kv_threads);
 
     diagnostic_msgs::msg::KeyValue kv_limit;
     kv_limit.key = "max_threads";
     kv_limit.value = std::to_string(max_threads_);
     status.values.push_back(kv_limit);
 
-    for (const auto & [topic, ctx] : threads_) {
-      diagnostic_msgs::msg::KeyValue kv;
-      kv.key = "topic";
-      kv.value = topic;
-      status.values.push_back(kv);
+    diagnostic_msgs::msg::KeyValue kv_jobs;
+    kv_jobs.key = "active_detections";
+    kv_jobs.value = std::to_string(total_jobs);
+    status.values.push_back(kv_jobs);
+
+    for (const auto & [topic, cam] : camera_threads_) {
+      for (const auto & [id, job] : cam->jobs) {
+        diagnostic_msgs::msg::KeyValue kv;
+        kv.key = "detection";
+        kv.value = topic + "#" + id;
+        status.values.push_back(kv);
+      }
     }
 
     diag_array.status.push_back(status);
@@ -407,11 +545,11 @@ private:
     std::vector<std::string> to_remove;
 
     std::lock_guard<std::mutex> lock(threads_mutex_);
-    for (auto & [topic, ctx] : threads_) {
+    for (auto & [topic, cam] : camera_threads_) {
       std::chrono::steady_clock::time_point last;
       {
-        std::lock_guard<std::mutex> tlock(ctx->time_mutex);
-        last = ctx->last_image_time;
+        std::lock_guard<std::mutex> tlock(cam->time_mutex);
+        last = cam->last_image_time;
       }
 
       auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last);
@@ -419,8 +557,9 @@ private:
       if (elapsed.count() > 60) {
         RCLCPP_ERROR(this->get_logger(),
           "Camera feed for aruco processing '%s' not receiving data. "
-          "Timeout exceeded (60s). Shutting down processing thread.", topic.c_str());
-        shutdown_thread(ctx);
+          "Timeout exceeded (60s). Shutting down processing thread (%zu detections).",
+          topic.c_str(), cam->jobs.size());
+        shutdown_thread(cam);
         to_remove.push_back(topic);
       } else if (elapsed.count() > 30) {
         RCLCPP_WARN(this->get_logger(),
@@ -442,16 +581,19 @@ private:
     }
 
     for (const auto & topic : to_remove) {
-      threads_.erase(topic);
+      camera_threads_.erase(topic);
     }
   }
 
-  void shutdown_thread(std::shared_ptr<ProcessingThread> ctx)
+  void shutdown_thread(std::shared_ptr<CameraThread> cam)
   {
-    ctx->active = false;
-    ctx->image_sub.reset();
-    ctx->feed_pub.reset();
-    ctx->markers_pub.reset();
+    cam->active = false;
+    for (auto & [id, job] : cam->jobs) {
+      job->feed_pub.reset();
+      job->markers_pub.reset();
+    }
+    cam->jobs.clear();
+    cam->image_sub.reset();
   }
 };
 

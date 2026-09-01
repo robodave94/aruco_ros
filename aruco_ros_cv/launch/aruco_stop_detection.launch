@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Calls stop_detection on aruco_action_server without hand-writing the CLI call -->
+
+    <arg name="action_server_name" default="aruco_action_server"
+         description="Name of the aruco_action_server node"/>
+
+    <arg name="image_topic" default="/camera/image_raw"
+         description="Camera image topic to stop detection on"/>
+
+    <arg name="detection_id" default=""
+         description="Id of the detection to stop (default: stop every detection on the topic)"/>
+
+    <node pkg="aruco_ros_cv" exec="aruco_stop_detection"
+          name="aruco_stop_detection" output="screen">
+        <param name="action_server_name" value="$(var action_server_name)"/>
+        <param name="image_topic" value="$(var image_topic)"/>
+        <param name="detection_id" value="$(var detection_id)"/>
+    </node>
+</launch>

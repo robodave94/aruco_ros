@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Sends a start_detection goal to aruco_action_server without hand-writing the CLI call -->
+
+    <arg name="action_server_name" default="aruco_action_server"
+         description="Name of the aruco_action_server node"/>
+
+    <arg name="image_topic" default="/camera/image_raw"
+         description="Camera image topic to start detection on"/>
+
+    <arg name="dictionaries" default="['DICT_6X6_250']"
+         description="List of ArUco dictionary names"/>
+
+    <arg name="marker_sizes" default="[0.05]"
+         description="List of marker sizes in meters, parallel to dictionaries"/>
+
+    <arg name="camera_params_file"
+         default="$(find-pkg-share aruco_ros_cv)/resources/camera_params.yml"
+         description="Path to an OpenCV YAML camera intrinsics file"/>
+
+    <arg name="detection_id" default=""
+         description="Optional id for this detection (default: auto-generated from dictionaries)"/>
+
+    <node pkg="aruco_ros_cv" exec="aruco_start_detection"
+          name="aruco_start_detection" output="screen">
+        <param name="action_server_name" value="$(var action_server_name)"/>
+        <param name="image_topic" value="$(var image_topic)"/>
+        <param name="dictionaries" value="$(var dictionaries)"/>
+        <param name="marker_sizes" value="$(var marker_sizes)"/>
+        <param name="camera_params_file" value="$(var camera_params_file)"/>
+        <param name="detection_id" value="$(var detection_id)"/>
+    </node>
+</launch>

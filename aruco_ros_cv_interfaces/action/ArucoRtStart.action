@@ -3,10 +3,12 @@ string image_topic
 string[] dictionaries
 float64[] marker_sizes
 sensor_msgs/CameraInfo camera_info
+string detection_id
 ---
 # Result
 bool success
 string message
+string detection_id
 ---
 # Feedback
 string status

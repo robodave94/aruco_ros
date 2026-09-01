@@ -64,9 +64,13 @@ public:
       }
     }
 
+    // Depth 1 so a slow callback processes the newest frame instead of a backlog.
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-      image_topic_, rclcpp::SensorDataQoS(),
+      image_topic_, rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&CameraCalibrationNode::image_callback, this, std::placeholders::_1));
+
+    std::string vis_topic = image_topic_ + "/calibration_feed";
+    vis_pub_ = this->create_publisher<sensor_msgs::msg::Image>(vis_topic, 10);
 
     RCLCPP_INFO(this->get_logger(), "Camera calibration node started");
     RCLCPP_INFO(this->get_logger(), "  Image topic:        %s", image_topic_.c_str());
@@ -74,6 +78,7 @@ public:
     RCLCPP_INFO(this->get_logger(), "  Square size:        %.4f m", square_size_);
     RCLCPP_INFO(this->get_logger(), "  Frames to collect:  %d", num_frames_);
     RCLCPP_INFO(this->get_logger(), "  Output file:        %s", output_file_.c_str());
+    RCLCPP_INFO(this->get_logger(), "  Visualization feed: %s", vis_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "Waiting for images with checkerboard pattern...");
   }
 
@@ -95,6 +100,7 @@ private:
   std::mutex mutex_;
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr vis_pub_;
 
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
   {
@@ -139,6 +145,24 @@ private:
       if (frames_collected_ >= num_frames_) {
         run_calibration();
       }
+    }
+
+    // Publish an annotated view so the board/camera framing can be tuned live.
+    if (vis_pub_->get_subscription_count() > 0) {
+      cv::Mat vis = image.clone();
+      if (found) {
+        cv::drawChessboardCorners(vis, board_size_, corners, found);
+      }
+      std::string status = "Frames collected: " + std::to_string(frames_collected_) +
+        "/" + std::to_string(num_frames_);
+      cv::putText(vis, status, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8,
+        found ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 2);
+
+      cv_bridge::CvImage out;
+      out.header = msg->header;
+      out.encoding = sensor_msgs::image_encodings::BGR8;
+      out.image = vis;
+      vis_pub_->publish(*out.toImageMsg());
     }
   }
 

@@ -126,6 +126,13 @@ inline bool loadCameraIntrinsicsFromYAML(
   }
   fs["cameraMatrix"] >> camera_matrix;
   fs["distCoeffs"] >> dist_coeffs;
+  // Fall back to the snake_case keys used by saveCameraIntrinsicsToYAML and some external tools.
+  if (camera_matrix.empty()) {
+    fs["camera_matrix"] >> camera_matrix;
+  }
+  if (dist_coeffs.empty()) {
+    fs["dist_coeffs"] >> dist_coeffs;
+  }
   fs.release();
   if (camera_matrix.empty() || dist_coeffs.empty()) {
     return false;
