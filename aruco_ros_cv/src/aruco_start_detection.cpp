@@ -41,6 +41,15 @@ public:
     this->declare_parameter<std::vector<double>>("marker_sizes", {0.05});
     this->declare_parameter<std::string>("camera_params_file", "");
     this->declare_parameter<std::string>("detection_id", "");
+    this->declare_parameter<std::string>("reference_frame", "");
+    this->declare_parameter<bool>("zoom_enabled", false);
+    this->declare_parameter<double>("zoom_center_x", -1.0);
+    this->declare_parameter<double>("zoom_center_y", -1.0);
+    this->declare_parameter<double>("zoom_width", 500.0);
+    this->declare_parameter<double>("zoom_height", 500.0);
+    this->declare_parameter<double>("zoom_upscale", 1.5);
+    this->declare_parameter<bool>("zoom_rescale_distortion", false);
+    this->declare_parameter<bool>("zoom_debug_enabled", false);
   }
 
   bool run()
@@ -51,6 +60,15 @@ public:
     std::vector<double> marker_sizes = this->get_parameter("marker_sizes").as_double_array();
     std::string camera_params_file = this->get_parameter("camera_params_file").as_string();
     std::string detection_id = this->get_parameter("detection_id").as_string();
+    std::string reference_frame = this->get_parameter("reference_frame").as_string();
+    bool zoom_enabled = this->get_parameter("zoom_enabled").as_bool();
+    double zoom_center_x = this->get_parameter("zoom_center_x").as_double();
+    double zoom_center_y = this->get_parameter("zoom_center_y").as_double();
+    double zoom_width = this->get_parameter("zoom_width").as_double();
+    double zoom_height = this->get_parameter("zoom_height").as_double();
+    double zoom_upscale = this->get_parameter("zoom_upscale").as_double();
+    bool zoom_rescale_distortion = this->get_parameter("zoom_rescale_distortion").as_bool();
+    bool zoom_debug_enabled = this->get_parameter("zoom_debug_enabled").as_bool();
 
     if (dictionaries.empty() || dictionaries.size() != marker_sizes.size()) {
       RCLCPP_ERROR(this->get_logger(),
@@ -95,6 +113,15 @@ public:
     goal.marker_sizes = marker_sizes;
     goal.camera_info = camera_info;
     goal.detection_id = detection_id;
+    goal.reference_frame = reference_frame;
+    goal.zoom_enabled = zoom_enabled;
+    goal.zoom_center_x = zoom_center_x;
+    goal.zoom_center_y = zoom_center_y;
+    goal.zoom_width = zoom_width;
+    goal.zoom_height = zoom_height;
+    goal.zoom_upscale = zoom_upscale;
+    goal.zoom_rescale_distortion = zoom_rescale_distortion;
+    goal.zoom_debug_enabled = zoom_debug_enabled;
 
     RCLCPP_INFO(this->get_logger(), "Requesting detection on %s (server: %s)",
       image_topic.c_str(), action_server_name.c_str());

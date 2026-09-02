@@ -20,6 +20,9 @@ find_package(aruco_ros_cv_interfaces REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 
 # Common dependencies list (no shared library — header-only approach)
@@ -59,13 +62,13 @@ add_aruco_node(single_aruco_image_detection
 # ---- Part 3: RT capture node ----
 add_aruco_node(aruco_rt_capture
   src/aruco_rt_capture.cpp
-  ${COMMON_DEPS} image_transport
+  ${COMMON_DEPS} image_transport tf2 tf2_ros tf2_geometry_msgs
 )
 
 # ---- Part 4: Action server node ----
 add_aruco_node(aruco_action_server
   src/aruco_action_server.cpp
-  ${COMMON_DEPS} rclcpp_action aruco_ros_cv_interfaces diagnostic_msgs
+  ${COMMON_DEPS} rclcpp_action aruco_ros_cv_interfaces diagnostic_msgs tf2 tf2_ros tf2_geometry_msgs
 )
 
 # ---- Part 5: Camera calibration node ----

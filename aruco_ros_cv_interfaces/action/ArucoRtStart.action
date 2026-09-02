@@ -4,6 +4,17 @@ string[] dictionaries
 float64[] marker_sizes
 sensor_msgs/CameraInfo camera_info
 string detection_id
+# TF parent frame for broadcast marker transforms; empty => use image header frame_id
+string reference_frame
+# Optional crop + upscale to improve detection of small markers
+bool zoom_enabled
+float64 zoom_center_x   # crop center x in px; <0 => image principal point
+float64 zoom_center_y   # crop center y in px; <0 => image principal point
+float64 zoom_width      # crop width in px (e.g. 500)
+float64 zoom_height     # crop height in px (e.g. 500)
+float64 zoom_upscale    # upscale factor applied to the crop (e.g. 1.5)
+bool zoom_rescale_distortion   # true => undistort crop before detection; false => pass dist as-is
+bool zoom_debug_enabled   # true => also publish the upscaled-crop debug feed
 ---
 # Result
 bool success

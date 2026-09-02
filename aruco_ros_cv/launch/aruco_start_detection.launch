@@ -21,6 +21,23 @@
     <arg name="detection_id" default=""
          description="Optional id for this detection (default: auto-generated from dictionaries)"/>
 
+    <arg name="reference_frame" default=""
+         description="TF parent frame for broadcast marker transforms (empty => image frame_id)"/>
+
+    <arg name="zoom_enabled" default="false"
+         description="Crop + upscale the frame before detection to help see small markers"/>
+    <arg name="zoom_center_x" default="-1.0"
+         description="Crop center x in px (&lt;0 => image principal point)"/>
+    <arg name="zoom_center_y" default="-1.0"
+         description="Crop center y in px (&lt;0 => image principal point)"/>
+    <arg name="zoom_width" default="500.0" description="Crop width in px"/>
+    <arg name="zoom_height" default="500.0" description="Crop height in px"/>
+    <arg name="zoom_upscale" default="1.5" description="Upscale factor applied to the crop"/>
+    <arg name="zoom_rescale_distortion" default="false"
+         description="Undistort the crop before detection (default false)"/>
+    <arg name="zoom_debug_enabled" default="false"
+         description="Also publish the upscaled-crop debug feed (default false)"/>
+
     <node pkg="aruco_ros_cv" exec="aruco_start_detection"
           name="aruco_start_detection" output="screen">
         <param name="action_server_name" value="$(var action_server_name)"/>
@@ -29,5 +46,14 @@
         <param name="marker_sizes" value="$(var marker_sizes)"/>
         <param name="camera_params_file" value="$(var camera_params_file)"/>
         <param name="detection_id" value="$(var detection_id)"/>
+        <param name="reference_frame" value="$(var reference_frame)"/>
+        <param name="zoom_enabled" value="$(var zoom_enabled)"/>
+        <param name="zoom_center_x" value="$(var zoom_center_x)"/>
+        <param name="zoom_center_y" value="$(var zoom_center_y)"/>
+        <param name="zoom_width" value="$(var zoom_width)"/>
+        <param name="zoom_height" value="$(var zoom_height)"/>
+        <param name="zoom_upscale" value="$(var zoom_upscale)"/>
+        <param name="zoom_rescale_distortion" value="$(var zoom_rescale_distortion)"/>
+        <param name="zoom_debug_enabled" value="$(var zoom_debug_enabled)"/>
     </node>
 </launch>

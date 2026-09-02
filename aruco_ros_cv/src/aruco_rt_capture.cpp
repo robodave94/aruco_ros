@@ -26,6 +26,13 @@
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <std_msgs/msg/header.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include "aruco_msgs/msg/marker.hpp"
 #include "aruco_msgs/msg/marker_array.hpp"
 #include "aruco_ros_cv/aruco_cv_utils.hpp"
@@ -41,12 +48,14 @@ public:
     this->declare_parameter<std::vector<std::string>>("dictionaries", {"DICT_6X6_250"});
     this->declare_parameter<std::vector<double>>("marker_sizes", {0.05});
     this->declare_parameter<std::string>("camera_info_topic", "/camera/camera_info");
+    this->declare_parameter<std::string>("reference_frame", "");
 
     // Get parameters
     image_topic_ = this->get_parameter("image_topic").as_string();
     dictionaries_ = this->get_parameter("dictionaries").as_string_array();
     marker_sizes_ = this->get_parameter("marker_sizes").as_double_array();
     camera_info_topic_ = this->get_parameter("camera_info_topic").as_string();
+    reference_frame_ = this->get_parameter("reference_frame").as_string();
 
     if (dictionaries_.size() != marker_sizes_.size()) {
       RCLCPP_ERROR(this->get_logger(), "dictionaries and marker_sizes must have equal length");
@@ -80,6 +89,11 @@ public:
       camera_info_topic_, rclcpp::QoS(1).transient_local(),
       std::bind(&ArucoRtCaptureNode::camera_info_callback, this, std::placeholders::_1));
 
+    // TF broadcaster + listener for marker transforms
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
     RCLCPP_INFO(this->get_logger(), "ArUco RT capture started");
     RCLCPP_INFO(this->get_logger(), "  Input topic:   %s", image_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "  Feed topic:    %s", feed_topic.c_str());
@@ -98,6 +112,11 @@ private:
   cv::Mat cam_mtx_;
   cv::Mat dist_coeffs_;
   bool camera_info_received_ = false;
+
+  std::string reference_frame_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_info_sub_;
@@ -201,6 +220,71 @@ private:
 
       markers_pub_->publish(marker_array);
     }
+
+    broadcast_marker_tfs(det, msg->header);
+  }
+
+  /** Broadcast one TF per detected marker; transform into reference_frame via tf2. */
+  void broadcast_marker_tfs(
+    const aruco_ros_cv::DetectionResult & det,
+    const std_msgs::msg::Header & header)
+  {
+    if (det.markers.empty()) return;
+
+    const std::string & camera_frame = header.frame_id;
+    std::string parent_frame =
+      reference_frame_.empty() ? camera_frame : reference_frame_;
+    bool need_transform = (parent_frame != camera_frame);
+
+    auto names = aruco_ros_cv::buildUniqueMarkerFrameNames(det);
+
+    std::vector<geometry_msgs::msg::TransformStamped> transforms;
+    transforms.reserve(det.markers.size());
+
+    for (size_t i = 0; i < det.markers.size(); ++i) {
+      const auto & m = det.markers[i];
+      double px, py, pz, qx, qy, qz, qw;
+      aruco_ros_cv::rvecTvecToPositionQuat(m.rvec, m.tvec, px, py, pz, qx, qy, qz, qw);
+
+      geometry_msgs::msg::PoseStamped pose_in;
+      pose_in.header = header;
+      pose_in.pose.position.x = px;
+      pose_in.pose.position.y = py;
+      pose_in.pose.position.z = pz;
+      pose_in.pose.orientation.x = qx;
+      pose_in.pose.orientation.y = qy;
+      pose_in.pose.orientation.z = qz;
+      pose_in.pose.orientation.w = qw;
+
+      std::string frame_parent = parent_frame;
+      geometry_msgs::msg::Pose pose_out = pose_in.pose;
+
+      if (need_transform) {
+        try {
+          geometry_msgs::msg::PoseStamped transformed =
+            tf_buffer_->transform(pose_in, parent_frame, tf2::durationFromSec(0.05));
+          pose_out = transformed.pose;
+        } catch (const tf2::TransformException & ex) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "TF %s->%s failed: %s (publishing in camera frame)",
+            camera_frame.c_str(), parent_frame.c_str(), ex.what());
+          frame_parent = camera_frame;
+          pose_out = pose_in.pose;
+        }
+      }
+
+      geometry_msgs::msg::TransformStamped t;
+      t.header.stamp = header.stamp;
+      t.header.frame_id = frame_parent;
+      t.child_frame_id = names[i];
+      t.transform.translation.x = pose_out.position.x;
+      t.transform.translation.y = pose_out.position.y;
+      t.transform.translation.z = pose_out.position.z;
+      t.transform.rotation = pose_out.orientation;
+      transforms.push_back(t);
+    }
+
+    tf_broadcaster_->sendTransform(transforms);
   }
 };
 

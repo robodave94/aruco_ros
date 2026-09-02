@@ -41,6 +41,14 @@
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
 
+#include <std_msgs/msg/header.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
 #include "aruco_ros_cv_interfaces/action/aruco_rt_start.hpp"
 #include "aruco_ros_cv_interfaces/srv/aruco_rt_stop.hpp"
 #include "aruco_msgs/msg/marker.hpp"
@@ -88,7 +96,13 @@ struct DetectionJob
   cv::Mat cam_mtx;
   cv::Mat dist_coeffs;
 
+  std::string reference_frame;   // TF parent; empty => image header frame_id
+  bool zoom_enabled{false};
+  bool zoom_debug_enabled{false};
+  aruco_ros_cv::ZoomConfig zoom;
+
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr feed_pub;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr zoom_debug_pub;
   rclcpp::Publisher<aruco_msgs::msg::MarkerArray>::SharedPtr markers_pub;
 };
 
@@ -143,6 +157,11 @@ public:
       std::chrono::seconds(5),
       std::bind(&ArucoActionServerNode::watchdog_check, this));
 
+    // TF broadcaster + listener for marker transforms
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
     RCLCPP_INFO(this->get_logger(), "ArUco action server started (max threads: %zu)",
       max_threads_);
   }
@@ -157,6 +176,10 @@ private:
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub_;
   rclcpp::TimerBase::SharedPtr diag_timer_;
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
+
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // -------------------------------------------------------------------------
   // Action server callbacks
@@ -263,11 +286,28 @@ private:
       job->cam_mtx = aruco_ros_cv::buildCameraMatrix(ci.k[0], ci.k[4], ci.k[2], ci.k[5]);
       job->dist_coeffs = cv::Mat(ci.d, true);
 
+      job->reference_frame = goal->reference_frame;
+      job->zoom_enabled = goal->zoom_enabled;
+      job->zoom_debug_enabled = goal->zoom_debug_enabled;
+      job->zoom.center_x = goal->zoom_center_x;
+      job->zoom.center_y = goal->zoom_center_y;
+      job->zoom.width = (goal->zoom_width > 0.0) ? goal->zoom_width : 500.0;
+      job->zoom.height = (goal->zoom_height > 0.0) ? goal->zoom_height : 500.0;
+      job->zoom.upscale = (goal->zoom_upscale > 0.0) ? goal->zoom_upscale : 1.5;
+      job->zoom.rescale_distortion = goal->zoom_rescale_distortion;
+
       std::string feed_topic = goal->image_topic + "/arucofeed/" + detection_id;
       std::string markers_topic = goal->image_topic + "/arucofeed/markers/" + detection_id;
       job->feed_pub = this->create_publisher<sensor_msgs::msg::Image>(feed_topic, 10);
       job->markers_pub = this->create_publisher<aruco_msgs::msg::MarkerArray>(
         markers_topic, 10);
+
+      if (job->zoom_enabled && job->zoom_debug_enabled) {
+        std::string zoom_debug_topic =
+          goal->image_topic + "/arucofeed/zoomdebug/" + detection_id;
+        job->zoom_debug_pub =
+          this->create_publisher<sensor_msgs::msg::Image>(zoom_debug_topic, 10);
+      }
 
       // Only a brand-new camera thread needs its own subscription
       if (created_thread) {
@@ -359,6 +399,7 @@ private:
 
     job_it->second->feed_pub.reset();
     job_it->second->markers_pub.reset();
+    job_it->second->zoom_debug_pub.reset();
     cam->jobs.erase(job_it);
 
     response->success = true;
@@ -417,14 +458,34 @@ private:
 
     for (const auto & job : jobs_snapshot) {
       aruco_ros_cv::DetectionResult det;
+      cv::Mat zoom_debug;
+      bool want_zoom_debug =
+        job->zoom_enabled && job->zoom_debug_pub &&
+        job->zoom_debug_pub->get_subscription_count() > 0;
       try {
-        det = aruco_ros_cv::detectMultiDictMarkers(
-          image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs);
+        if (job->zoom_enabled) {
+          det = aruco_ros_cv::detectMultiDictMarkersZoomed(
+            image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs,
+            job->zoom, want_zoom_debug ? &zoom_debug : nullptr);
+        } else {
+          det = aruco_ros_cv::detectMultiDictMarkers(
+            image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs);
+        }
       } catch (const std::exception & e) {
         RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
           "Detection error on %s [%s]: %s", cam->image_topic.c_str(),
           job->detection_id.c_str(), e.what());
         continue;
+      }
+
+      // Publish zoomed-crop debug feed
+      if (want_zoom_debug && !zoom_debug.empty()) {
+        cv_bridge::CvImage dbg;
+        dbg.header.stamp = msg->header.stamp;
+        dbg.header.frame_id = msg->header.frame_id;
+        dbg.encoding = sensor_msgs::image_encodings::BGR8;
+        dbg.image = zoom_debug;
+        job->zoom_debug_pub->publish(*dbg.toImageMsg());
       }
 
       // Publish visualized feed
@@ -480,7 +541,73 @@ private:
 
         job->markers_pub->publish(marker_array);
       }
+
+      broadcast_marker_tfs(job, det, msg->header);
     }
+  }
+
+  /** Broadcast one TF per detected marker; transform into reference_frame via tf2. */
+  void broadcast_marker_tfs(
+    const std::shared_ptr<DetectionJob> & job,
+    const aruco_ros_cv::DetectionResult & det,
+    const std_msgs::msg::Header & header)
+  {
+    if (det.markers.empty()) return;
+
+    const std::string & camera_frame = header.frame_id;
+    std::string parent_frame =
+      job->reference_frame.empty() ? camera_frame : job->reference_frame;
+    bool need_transform = (parent_frame != camera_frame);
+
+    auto names = aruco_ros_cv::buildUniqueMarkerFrameNames(det);
+
+    std::vector<geometry_msgs::msg::TransformStamped> transforms;
+    transforms.reserve(det.markers.size());
+
+    for (size_t i = 0; i < det.markers.size(); ++i) {
+      const auto & m = det.markers[i];
+      double px, py, pz, qx, qy, qz, qw;
+      aruco_ros_cv::rvecTvecToPositionQuat(m.rvec, m.tvec, px, py, pz, qx, qy, qz, qw);
+
+      geometry_msgs::msg::PoseStamped pose_in;
+      pose_in.header = header;
+      pose_in.pose.position.x = px;
+      pose_in.pose.position.y = py;
+      pose_in.pose.position.z = pz;
+      pose_in.pose.orientation.x = qx;
+      pose_in.pose.orientation.y = qy;
+      pose_in.pose.orientation.z = qz;
+      pose_in.pose.orientation.w = qw;
+
+      std::string frame_parent = parent_frame;
+      geometry_msgs::msg::Pose pose_out = pose_in.pose;
+
+      if (need_transform) {
+        try {
+          geometry_msgs::msg::PoseStamped transformed =
+            tf_buffer_->transform(pose_in, parent_frame, tf2::durationFromSec(0.05));
+          pose_out = transformed.pose;
+        } catch (const tf2::TransformException & ex) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "TF %s->%s failed: %s (publishing in camera frame)",
+            camera_frame.c_str(), parent_frame.c_str(), ex.what());
+          frame_parent = camera_frame;
+          pose_out = pose_in.pose;
+        }
+      }
+
+      geometry_msgs::msg::TransformStamped t;
+      t.header.stamp = header.stamp;
+      t.header.frame_id = frame_parent;
+      t.child_frame_id = names[i];
+      t.transform.translation.x = pose_out.position.x;
+      t.transform.translation.y = pose_out.position.y;
+      t.transform.translation.z = pose_out.position.z;
+      t.transform.rotation = pose_out.orientation;
+      transforms.push_back(t);
+    }
+
+    tf_broadcaster_->sendTransform(transforms);
   }
 
   // -------------------------------------------------------------------------
@@ -591,6 +718,7 @@ private:
     for (auto & [id, job] : cam->jobs) {
       job->feed_pub.reset();
       job->markers_pub.reset();
+      job->zoom_debug_pub.reset();
     }
     cam->jobs.clear();
     cam->image_sub.reset();
