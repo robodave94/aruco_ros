@@ -9,16 +9,22 @@
  * Features:
  *   - Dynamically spawn/stop processing threads per camera topic
  *   - Multiple detections (different dictionaries/ids) can share one camera topic's
- *     thread/subscription — only distinct topics count against 'max_processing_threads'
+ *     subscription — only distinct topics count against 'max_processing_threads'
+ *   - Each detection job runs its own dedicated worker thread, processing the most
+ *     recently received frame in parallel with every other job on the same topic
+ *     (the shared subscription callback only decodes the image and hands it off)
  *   - Max thread limit (default 10, configurable via 'max_processing_threads' param)
+ *     bounds camera-topic subscriptions only, not per-job worker threads
  *   - Watchdog: warns if no image received for 60s, then shuts down that topic's thread
  *   - Each detection publishes <topic>/arucofeed/<detection_id> and
  *     <topic>/arucofeed/markers/<detection_id>
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -54,6 +60,7 @@
 #include "aruco_msgs/msg/marker.hpp"
 #include "aruco_msgs/msg/marker_array.hpp"
 #include "aruco_ros_cv/aruco_cv_utils.hpp"
+#include "aruco_ros_cv/pose_filter.hpp"
 
 using ArucoRtStart = aruco_ros_cv_interfaces::action::ArucoRtStart;
 using ArucoRtStop = aruco_ros_cv_interfaces::srv::ArucoRtStop;
@@ -71,10 +78,34 @@ inline std::string sanitizeToken(const std::string & s)
   return out;
 }
 
-/** Resolve the id used to key/name a detection: explicit id, or dictionaries joined by '_'. */
+/** Build a detection_id suffix describing a marker_ids filter (empty => no filter, no suffix). */
+inline std::string markerIdsSuffix(const std::vector<int32_t> & marker_ids)
+{
+  if (marker_ids.empty()) {
+    return "";
+  }
+  std::vector<int32_t> sorted_ids = marker_ids;
+  std::sort(sorted_ids.begin(), sorted_ids.end());
+  sorted_ids.erase(std::unique(sorted_ids.begin(), sorted_ids.end()), sorted_ids.end());
+
+  if (sorted_ids.size() == 1) {
+    return "_id" + std::to_string(sorted_ids.front());
+  }
+  const int32_t min_id = sorted_ids.front();
+  const int32_t max_id = sorted_ids.back();
+  // A dense run of ids reads better as a range than as an enumerated custom list.
+  const bool contiguous = (static_cast<size_t>(max_id - min_id + 1) == sorted_ids.size());
+  if (contiguous) {
+    return "_idrange" + std::to_string(min_id) + "_" + std::to_string(max_id);
+  }
+  return "_customids_minID" + std::to_string(min_id) + "_maxID" + std::to_string(max_id);
+}
+
+/** Resolve the id used to key/name a detection: explicit id, or dictionaries+marker_ids derived. */
 inline std::string resolveDetectionId(
   const std::string & requested_id,
-  const std::vector<std::string> & dictionaries)
+  const std::vector<std::string> & dictionaries,
+  const std::vector<int32_t> & marker_ids)
 {
   if (!requested_id.empty()) {
     return sanitizeToken(requested_id);
@@ -84,6 +115,7 @@ inline std::string resolveDetectionId(
     if (i > 0) joined += "_";
     joined += dictionaries[i];
   }
+  joined += markerIdsSuffix(marker_ids);
   return sanitizeToken(joined);
 }
 
@@ -100,13 +132,22 @@ struct DetectionJob
   bool zoom_enabled{false};
   bool zoom_debug_enabled{false};
   aruco_ros_cv::ZoomConfig zoom;
+  double error_correction_rate{0.6};
+  std::vector<int32_t> marker_ids;   // empty => accept all detected ids
+
+  // Temporal pose smoothing; state lives on the job so it stays single-threaded.
+  aruco_ros_cv::PoseFilter pose_filter;
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr feed_pub;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr zoom_debug_pub;
   rclcpp::Publisher<aruco_msgs::msg::MarkerArray>::SharedPtr markers_pub;
+
+  std::thread worker;              // dedicated per-job processing thread
+  std::atomic<bool> running{true}; // false => worker should exit
 };
 
-/** Per-topic processing context — one subscription shared by all of its detection jobs. */
+/** Per-topic processing context — one subscription shared by all of its detection jobs;
+ *  each job then processes the latest frame on its own worker thread. */
 struct CameraThread
 {
   std::string image_topic;
@@ -118,6 +159,13 @@ struct CameraThread
   std::mutex time_mutex;
 
   std::map<std::string, std::shared_ptr<DetectionJob>> jobs;
+
+  // Latest decoded frame, shared read-only across every job's worker thread.
+  std::mutex frame_mutex;
+  std::condition_variable frame_cv;
+  cv::Mat latest_image;
+  std_msgs::msg::Header latest_header;
+  uint64_t frame_seq{0};
 };
 
 class ArucoActionServerNode : public rclcpp::Node
@@ -201,7 +249,8 @@ private:
       return rclcpp_action::GoalResponse::REJECT;
     }
 
-    std::string detection_id = resolveDetectionId(goal->detection_id, goal->dictionaries);
+    std::string detection_id =
+      resolveDetectionId(goal->detection_id, goal->dictionaries, goal->marker_ids);
 
     std::lock_guard<std::mutex> lock(threads_mutex_);
 
@@ -250,7 +299,8 @@ private:
         aruco_ros_cv::dictionaryFromString(d);
       }
 
-      std::string detection_id = resolveDetectionId(goal->detection_id, goal->dictionaries);
+      std::string detection_id =
+        resolveDetectionId(goal->detection_id, goal->dictionaries, goal->marker_ids);
 
       // Find or create the camera thread for this topic
       std::shared_ptr<CameraThread> cam;
@@ -282,6 +332,7 @@ private:
       job->detection_id = detection_id;
       job->dictionaries = goal->dictionaries;
       job->marker_sizes = goal->marker_sizes;
+      job->marker_ids = goal->marker_ids;
       const auto & ci = goal->camera_info;
       job->cam_mtx = aruco_ros_cv::buildCameraMatrix(ci.k[0], ci.k[4], ci.k[2], ci.k[5]);
       job->dist_coeffs = cv::Mat(ci.d, true);
@@ -295,6 +346,26 @@ private:
       job->zoom.height = (goal->zoom_height > 0.0) ? goal->zoom_height : 500.0;
       job->zoom.upscale = (goal->zoom_upscale > 0.0) ? goal->zoom_upscale : 1.5;
       job->zoom.rescale_distortion = goal->zoom_rescale_distortion;
+      job->zoom.contrast_alpha = (goal->zoom_contrast_alpha > 0.0) ? goal->zoom_contrast_alpha : 1.0;
+      job->zoom.contrast_beta = goal->zoom_contrast_beta;
+      job->zoom.glare_reduction_enabled = goal->zoom_glare_reduction_enabled;
+      job->zoom.glare_clip_limit =
+        (goal->zoom_glare_clip_limit > 0.0) ? goal->zoom_glare_clip_limit : 2.0;
+      job->zoom.glare_tile_grid_size =
+        (goal->zoom_glare_tile_grid_size > 0) ? goal->zoom_glare_tile_grid_size : 8;
+      job->error_correction_rate =
+        (goal->error_correction_rate > 0.0) ? goal->error_correction_rate : 0.6;
+
+      aruco_ros_cv::PoseFilterConfig smoothing;
+      smoothing.enabled = goal->smoothing_enabled;
+      smoothing.type = aruco_ros_cv::smoothingTypeFromString(goal->smoothing_type);
+      smoothing.window = (goal->smoothing_window > 0) ? goal->smoothing_window : 10;
+      smoothing.ema_alpha =
+        (goal->smoothing_ema_alpha > 0.0 && goal->smoothing_ema_alpha <= 1.0)
+        ? goal->smoothing_ema_alpha : 0.3;
+      smoothing.reset_timeout =
+        (goal->smoothing_reset_timeout > 0.0) ? goal->smoothing_reset_timeout : 0.5;
+      job->pose_filter.configure(smoothing);
 
       std::string feed_topic = goal->image_topic + "/arucofeed/" + detection_id;
       std::string markers_topic = goal->image_topic + "/arucofeed/markers/" + detection_id;
@@ -314,7 +385,7 @@ private:
         cam->image_sub = this->create_subscription<sensor_msgs::msg::Image>(
           goal->image_topic, rclcpp::SensorDataQoS(),
           [this, cam](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
-            process_image(cam, msg);
+            on_image(cam, msg);
           });
       }
 
@@ -328,6 +399,10 @@ private:
         }
         active_thread_count = camera_threads_.size();
       }
+
+      // Each job gets its own worker thread, so it processes frames in parallel
+      // with every other job on the same topic instead of serializing behind them.
+      job->worker = std::thread(&ArucoActionServerNode::job_loop, this, cam, job);
 
       // Send feedback periodically while goal is active
       auto feedback = std::make_shared<ArucoRtStart::Feedback>();
@@ -397,9 +472,7 @@ private:
       return;
     }
 
-    job_it->second->feed_pub.reset();
-    job_it->second->markers_pub.reset();
-    job_it->second->zoom_debug_pub.reset();
+    stop_job(cam, job_it->second);
     cam->jobs.erase(job_it);
 
     response->success = true;
@@ -421,28 +494,18 @@ private:
   // Image processing
   // -------------------------------------------------------------------------
 
-  void process_image(
+  /** Subscription callback: decode the frame once and hand it to every job's worker
+   *  thread — kept lightweight so it never serializes behind per-job detection work. */
+  void on_image(
     std::shared_ptr<CameraThread> cam,
     const sensor_msgs::msg::Image::ConstSharedPtr & msg)
   {
     if (!cam->active) return;
 
-    // Update last image timestamp
     {
       std::lock_guard<std::mutex> lock(cam->time_mutex);
       cam->last_image_time = std::chrono::steady_clock::now();
     }
-
-    // Snapshot the current jobs so detection/publishing doesn't hold the shared lock
-    std::vector<std::shared_ptr<DetectionJob>> jobs_snapshot;
-    {
-      std::lock_guard<std::mutex> lock(threads_mutex_);
-      jobs_snapshot.reserve(cam->jobs.size());
-      for (const auto & [id, job] : cam->jobs) {
-        jobs_snapshot.push_back(job);
-      }
-    }
-    if (jobs_snapshot.empty()) return;
 
     cv_bridge::CvImagePtr cv_ptr;
     try {
@@ -453,97 +516,153 @@ private:
       return;
     }
 
-    cv::Mat image = cv_ptr->image;
-    auto stamp = msg->header.stamp;
-
-    for (const auto & job : jobs_snapshot) {
-      aruco_ros_cv::DetectionResult det;
-      cv::Mat zoom_debug;
-      bool want_zoom_debug =
-        job->zoom_enabled && job->zoom_debug_pub &&
-        job->zoom_debug_pub->get_subscription_count() > 0;
-      try {
-        if (job->zoom_enabled) {
-          det = aruco_ros_cv::detectMultiDictMarkersZoomed(
-            image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs,
-            job->zoom, want_zoom_debug ? &zoom_debug : nullptr);
-        } else {
-          det = aruco_ros_cv::detectMultiDictMarkers(
-            image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs);
-        }
-      } catch (const std::exception & e) {
-        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-          "Detection error on %s [%s]: %s", cam->image_topic.c_str(),
-          job->detection_id.c_str(), e.what());
-        continue;
-      }
-
-      // Publish zoomed-crop debug feed
-      if (want_zoom_debug && !zoom_debug.empty()) {
-        cv_bridge::CvImage dbg;
-        dbg.header.stamp = msg->header.stamp;
-        dbg.header.frame_id = msg->header.frame_id;
-        dbg.encoding = sensor_msgs::image_encodings::BGR8;
-        dbg.image = zoom_debug;
-        job->zoom_debug_pub->publish(*dbg.toImageMsg());
-      }
-
-      // Publish visualized feed
-      if (job->feed_pub->get_subscription_count() > 0) {
-        cv::Mat vis = aruco_ros_cv::draw2DVisualization(image, det, job->dictionaries);
-        for (const auto & m : det.markers) {
-          float axis_len = static_cast<float>(m.marker_size) * 0.75f;
-          cv::drawFrameAxes(vis, job->cam_mtx, job->dist_coeffs, m.rvec, m.tvec, axis_len);
-        }
-        cv_bridge::CvImage out;
-        out.header.stamp = stamp;
-        out.header.frame_id = msg->header.frame_id;
-        out.encoding = sensor_msgs::image_encodings::BGR8;
-        out.image = vis;
-        job->feed_pub->publish(*out.toImageMsg());
-      }
-
-      // Publish marker array
-      if (job->markers_pub->get_subscription_count() > 0) {
-        aruco_msgs::msg::MarkerArray marker_array;
-        marker_array.header.stamp = stamp;
-        marker_array.header.frame_id = msg->header.frame_id;
-
-        for (const auto & m : det.markers) {
-          aruco_msgs::msg::Marker marker_msg;
-          marker_msg.header.stamp = stamp;
-          marker_msg.header.frame_id = msg->header.frame_id;
-          marker_msg.id = static_cast<uint32_t>(m.id);
-          marker_msg.confidence = 1.0;
-          marker_msg.dictionary = m.dictionary_name;
-          marker_msg.marker_size = m.marker_size;
-
-          for (const auto & c : m.corners) {
-            geometry_msgs::msg::Point pt;
-            pt.x = static_cast<double>(c.x);
-            pt.y = static_cast<double>(c.y);
-            pt.z = 0.0;
-            marker_msg.corners.push_back(pt);
-          }
-
-          double px, py, pz, qx, qy, qz, qw;
-          aruco_ros_cv::rvecTvecToPositionQuat(m.rvec, m.tvec, px, py, pz, qx, qy, qz, qw);
-          marker_msg.pose.pose.position.x = px;
-          marker_msg.pose.pose.position.y = py;
-          marker_msg.pose.pose.position.z = pz;
-          marker_msg.pose.pose.orientation.x = qx;
-          marker_msg.pose.pose.orientation.y = qy;
-          marker_msg.pose.pose.orientation.z = qz;
-          marker_msg.pose.pose.orientation.w = qw;
-
-          marker_array.markers.push_back(marker_msg);
-        }
-
-        job->markers_pub->publish(marker_array);
-      }
-
-      broadcast_marker_tfs(job, det, msg->header);
+    {
+      std::lock_guard<std::mutex> lock(cam->frame_mutex);
+      cam->latest_image = cv_ptr->image;
+      cam->latest_header = msg->header;
+      ++cam->frame_seq;
     }
+    cam->frame_cv.notify_all();
+  }
+
+  /** Per-job worker: waits for a new frame then runs detection/publishing for just
+   *  this job, in parallel with every other job's worker on the same topic. */
+  void job_loop(std::shared_ptr<CameraThread> cam, std::shared_ptr<DetectionJob> job)
+  {
+    uint64_t last_seq = 0;
+    while (rclcpp::ok() && cam->active && job->running) {
+      cv::Mat image;
+      std_msgs::msg::Header header;
+      {
+        std::unique_lock<std::mutex> lock(cam->frame_mutex);
+        cam->frame_cv.wait_for(lock, std::chrono::milliseconds(500), [&] {
+          return !cam->active || !job->running || cam->frame_seq != last_seq;
+        });
+        if (!cam->active || !job->running) break;
+        if (cam->frame_seq == last_seq) continue;   // woke on the timeout, nothing new yet
+        last_seq = cam->frame_seq;
+        // Cheap header copy — the underlying buffer is never mutated in place,
+        // so reading it here is safe while other jobs read the same frame.
+        image = cam->latest_image;
+        header = cam->latest_header;
+      }
+      process_job(cam, job, image, header);
+    }
+  }
+
+  /** Run detection + publishing for a single job against one already-decoded frame. */
+  void process_job(
+    const std::shared_ptr<CameraThread> & cam,
+    const std::shared_ptr<DetectionJob> & job,
+    const cv::Mat & image,
+    const std_msgs::msg::Header & header)
+  {
+    aruco_ros_cv::DetectionResult det;
+    cv::Mat zoom_debug;
+    bool want_zoom_debug =
+      job->zoom_enabled && job->zoom_debug_pub &&
+      job->zoom_debug_pub->get_subscription_count() > 0;
+    try {
+      if (job->zoom_enabled) {
+        det = aruco_ros_cv::detectMultiDictMarkersZoomed(
+          image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs,
+          job->zoom, want_zoom_debug ? &zoom_debug : nullptr, job->error_correction_rate);
+      } else {
+        det = aruco_ros_cv::detectMultiDictMarkers(
+          image, job->dictionaries, job->marker_sizes, job->cam_mtx, job->dist_coeffs,
+          job->error_correction_rate);
+      }
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "Detection error on %s [%s]: %s", cam->image_topic.c_str(),
+        job->detection_id.c_str(), e.what());
+      return;
+    }
+
+    // Drop any detected marker outside the job's requested id set before publishing/TF.
+    if (!job->marker_ids.empty()) {
+      std::vector<aruco_ros_cv::DetectedMarker> filtered;
+      filtered.reserve(det.markers.size());
+      for (const auto & m : det.markers) {
+        if (std::find(job->marker_ids.begin(), job->marker_ids.end(), m.id) !=
+          job->marker_ids.end())
+        {
+          filtered.push_back(m);
+        }
+      }
+      det.markers = std::move(filtered);
+    }
+
+    // Smooth pose/orientation/corners in place so vis, MarkerArray and TF stay consistent.
+    job->pose_filter.apply(det, rclcpp::Time(header.stamp).seconds());
+
+    const auto & stamp = header.stamp;
+
+    // Publish zoomed-crop debug feed
+    if (want_zoom_debug && !zoom_debug.empty()) {
+      cv_bridge::CvImage dbg;
+      dbg.header.stamp = header.stamp;
+      dbg.header.frame_id = header.frame_id;
+      dbg.encoding = sensor_msgs::image_encodings::BGR8;
+      dbg.image = zoom_debug;
+      job->zoom_debug_pub->publish(*dbg.toImageMsg());
+    }
+
+    // Publish visualized feed
+    if (job->feed_pub->get_subscription_count() > 0) {
+      cv::Mat vis = aruco_ros_cv::draw2DVisualization(image, det, job->dictionaries);
+      for (const auto & m : det.markers) {
+        float axis_len = static_cast<float>(m.marker_size) * 0.75f;
+        cv::drawFrameAxes(vis, job->cam_mtx, job->dist_coeffs, m.rvec, m.tvec, axis_len);
+      }
+      cv_bridge::CvImage out;
+      out.header.stamp = stamp;
+      out.header.frame_id = header.frame_id;
+      out.encoding = sensor_msgs::image_encodings::BGR8;
+      out.image = vis;
+      job->feed_pub->publish(*out.toImageMsg());
+    }
+
+    // Publish marker array
+    if (job->markers_pub->get_subscription_count() > 0) {
+      aruco_msgs::msg::MarkerArray marker_array;
+      marker_array.header.stamp = stamp;
+      marker_array.header.frame_id = header.frame_id;
+
+      for (const auto & m : det.markers) {
+        aruco_msgs::msg::Marker marker_msg;
+        marker_msg.header.stamp = stamp;
+        marker_msg.header.frame_id = header.frame_id;
+        marker_msg.id = static_cast<uint32_t>(m.id);
+        marker_msg.confidence = 1.0;
+        marker_msg.dictionary = m.dictionary_name;
+        marker_msg.marker_size = m.marker_size;
+
+        for (const auto & c : m.corners) {
+          geometry_msgs::msg::Point pt;
+          pt.x = static_cast<double>(c.x);
+          pt.y = static_cast<double>(c.y);
+          pt.z = 0.0;
+          marker_msg.corners.push_back(pt);
+        }
+
+        double px, py, pz, qx, qy, qz, qw;
+        aruco_ros_cv::rvecTvecToPositionQuat(m.rvec, m.tvec, px, py, pz, qx, qy, qz, qw);
+        marker_msg.pose.pose.position.x = px;
+        marker_msg.pose.pose.position.y = py;
+        marker_msg.pose.pose.position.z = pz;
+        marker_msg.pose.pose.orientation.x = qx;
+        marker_msg.pose.pose.orientation.y = qy;
+        marker_msg.pose.pose.orientation.z = qz;
+        marker_msg.pose.pose.orientation.w = qw;
+
+        marker_array.markers.push_back(marker_msg);
+      }
+
+      job->markers_pub->publish(marker_array);
+    }
+
+    broadcast_marker_tfs(job, det, header);
   }
 
   /** Broadcast one TF per detected marker; transform into reference_frame via tf2. */
@@ -715,13 +834,27 @@ private:
   void shutdown_thread(std::shared_ptr<CameraThread> cam)
   {
     cam->active = false;
+    cam->frame_cv.notify_all();
     for (auto & [id, job] : cam->jobs) {
-      job->feed_pub.reset();
-      job->markers_pub.reset();
-      job->zoom_debug_pub.reset();
+      stop_job(cam, job);
     }
     cam->jobs.clear();
     cam->image_sub.reset();
+  }
+
+  /** Stop and join a job's worker thread, then release its publishers. */
+  void stop_job(
+    const std::shared_ptr<CameraThread> & cam,
+    const std::shared_ptr<DetectionJob> & job)
+  {
+    job->running = false;
+    cam->frame_cv.notify_all();
+    if (job->worker.joinable()) {
+      job->worker.join();
+    }
+    job->feed_pub.reset();
+    job->markers_pub.reset();
+    job->zoom_debug_pub.reset();
   }
 };
 

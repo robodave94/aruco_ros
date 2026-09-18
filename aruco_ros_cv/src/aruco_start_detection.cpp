@@ -12,6 +12,8 @@
  *   marker_sizes        - List of marker sizes in meters, parallel to dictionaries
  *   camera_params_file  - Path to an OpenCV YAML camera intrinsics file
  *   detection_id        - Optional id for this detection (default: auto from dictionaries)
+ *   marker_ids          - Optional list of marker ids to keep; empty means accept all ids
+ *   zoom_glare_reduction_enabled - CLAHE-based glare reduction on the zoom crop (default false)
  */
 
 #include <chrono>
@@ -41,6 +43,7 @@ public:
     this->declare_parameter<std::vector<double>>("marker_sizes", {0.05});
     this->declare_parameter<std::string>("camera_params_file", "");
     this->declare_parameter<std::string>("detection_id", "");
+    this->declare_parameter<std::vector<int64_t>>("marker_ids", std::vector<int64_t>());
     this->declare_parameter<std::string>("reference_frame", "");
     this->declare_parameter<bool>("zoom_enabled", false);
     this->declare_parameter<double>("zoom_center_x", -1.0);
@@ -50,6 +53,17 @@ public:
     this->declare_parameter<double>("zoom_upscale", 1.5);
     this->declare_parameter<bool>("zoom_rescale_distortion", false);
     this->declare_parameter<bool>("zoom_debug_enabled", false);
+    this->declare_parameter<double>("zoom_contrast_alpha", 1.0);
+    this->declare_parameter<double>("zoom_contrast_beta", 0.0);
+    this->declare_parameter<bool>("zoom_glare_reduction_enabled", false);
+    this->declare_parameter<double>("zoom_glare_clip_limit", 2.0);
+    this->declare_parameter<int>("zoom_glare_tile_grid_size", 8);
+    this->declare_parameter<double>("error_correction_rate", 0.6);
+    this->declare_parameter<bool>("smoothing_enabled", true);
+    this->declare_parameter<int>("smoothing_window", 10);
+    this->declare_parameter<std::string>("smoothing_type", "moving_average");
+    this->declare_parameter<double>("smoothing_ema_alpha", 0.3);
+    this->declare_parameter<double>("smoothing_reset_timeout", 0.5);
   }
 
   bool run()
@@ -60,6 +74,8 @@ public:
     std::vector<double> marker_sizes = this->get_parameter("marker_sizes").as_double_array();
     std::string camera_params_file = this->get_parameter("camera_params_file").as_string();
     std::string detection_id = this->get_parameter("detection_id").as_string();
+    std::vector<int64_t> marker_ids_64 = this->get_parameter("marker_ids").as_integer_array();
+    std::vector<int32_t> marker_ids(marker_ids_64.begin(), marker_ids_64.end());
     std::string reference_frame = this->get_parameter("reference_frame").as_string();
     bool zoom_enabled = this->get_parameter("zoom_enabled").as_bool();
     double zoom_center_x = this->get_parameter("zoom_center_x").as_double();
@@ -69,6 +85,19 @@ public:
     double zoom_upscale = this->get_parameter("zoom_upscale").as_double();
     bool zoom_rescale_distortion = this->get_parameter("zoom_rescale_distortion").as_bool();
     bool zoom_debug_enabled = this->get_parameter("zoom_debug_enabled").as_bool();
+    double zoom_contrast_alpha = this->get_parameter("zoom_contrast_alpha").as_double();
+    double zoom_contrast_beta = this->get_parameter("zoom_contrast_beta").as_double();
+    bool zoom_glare_reduction_enabled =
+      this->get_parameter("zoom_glare_reduction_enabled").as_bool();
+    double zoom_glare_clip_limit = this->get_parameter("zoom_glare_clip_limit").as_double();
+    int zoom_glare_tile_grid_size =
+      static_cast<int>(this->get_parameter("zoom_glare_tile_grid_size").as_int());
+    double error_correction_rate = this->get_parameter("error_correction_rate").as_double();
+    bool smoothing_enabled = this->get_parameter("smoothing_enabled").as_bool();
+    int smoothing_window = static_cast<int>(this->get_parameter("smoothing_window").as_int());
+    std::string smoothing_type = this->get_parameter("smoothing_type").as_string();
+    double smoothing_ema_alpha = this->get_parameter("smoothing_ema_alpha").as_double();
+    double smoothing_reset_timeout = this->get_parameter("smoothing_reset_timeout").as_double();
 
     if (dictionaries.empty() || dictionaries.size() != marker_sizes.size()) {
       RCLCPP_ERROR(this->get_logger(),
@@ -113,6 +142,7 @@ public:
     goal.marker_sizes = marker_sizes;
     goal.camera_info = camera_info;
     goal.detection_id = detection_id;
+    goal.marker_ids = marker_ids;
     goal.reference_frame = reference_frame;
     goal.zoom_enabled = zoom_enabled;
     goal.zoom_center_x = zoom_center_x;
@@ -122,6 +152,17 @@ public:
     goal.zoom_upscale = zoom_upscale;
     goal.zoom_rescale_distortion = zoom_rescale_distortion;
     goal.zoom_debug_enabled = zoom_debug_enabled;
+    goal.zoom_contrast_alpha = zoom_contrast_alpha;
+    goal.zoom_contrast_beta = zoom_contrast_beta;
+    goal.zoom_glare_reduction_enabled = zoom_glare_reduction_enabled;
+    goal.zoom_glare_clip_limit = zoom_glare_clip_limit;
+    goal.zoom_glare_tile_grid_size = zoom_glare_tile_grid_size;
+    goal.error_correction_rate = error_correction_rate;
+    goal.smoothing_enabled = smoothing_enabled;
+    goal.smoothing_window = smoothing_window;
+    goal.smoothing_type = smoothing_type;
+    goal.smoothing_ema_alpha = smoothing_ema_alpha;
+    goal.smoothing_reset_timeout = smoothing_reset_timeout;
 
     RCLCPP_INFO(this->get_logger(), "Requesting detection on %s (server: %s)",
       image_topic.c_str(), action_server_name.c_str());

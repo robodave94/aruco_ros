@@ -4,6 +4,8 @@ string[] dictionaries
 float64[] marker_sizes
 sensor_msgs/CameraInfo camera_info
 string detection_id
+# Marker ids to keep after detection; empty => accept all ids
+int32[] marker_ids
 # TF parent frame for broadcast marker transforms; empty => use image header frame_id
 string reference_frame
 # Optional crop + upscale to improve detection of small markers
@@ -15,6 +17,20 @@ float64 zoom_height     # crop height in px (e.g. 500)
 float64 zoom_upscale    # upscale factor applied to the crop (e.g. 1.5)
 bool zoom_rescale_distortion   # true => undistort crop before detection; false => pass dist as-is
 bool zoom_debug_enabled   # true => also publish the upscaled-crop debug feed
+float64 zoom_contrast_alpha   # contrast gain on the zoom crop (1.0 => unchanged)
+float64 zoom_contrast_beta    # brightness offset on the zoom crop (0 => unchanged)
+# CLAHE-based glare reduction on the zoom crop, applied before the contrast stretch above
+bool zoom_glare_reduction_enabled
+float64 zoom_glare_clip_limit    # CLAHE clip limit; higher allows more local contrast (and glare) through
+int32 zoom_glare_tile_grid_size  # CLAHE tile grid size (NxN); smaller tiles localize suppression more
+# ArUco bit-error tolerance; higher accepts lower-confidence markers (OpenCV default 0.6)
+float64 error_correction_rate
+# Temporal pose smoothing applied per marker id before publish/visualization/TF
+bool smoothing_enabled
+int32 smoothing_window          # samples kept for moving_average/median (default 10)
+string smoothing_type           # moving_average | median | ema (default moving_average)
+float64 smoothing_ema_alpha     # EMA weight on the newest sample, 0..1 (default 0.3)
+float64 smoothing_reset_timeout # sec; drop a marker's history after this gap (default 0.5)
 ---
 # Result
 bool success

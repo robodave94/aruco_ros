@@ -177,7 +177,8 @@ inline DetectionResult detectMultiDictMarkers(
   const std::vector<std::string> & dictionaries,
   const std::vector<double> & marker_sizes,
   const cv::Mat & camera_matrix,
-  const cv::Mat & dist_coeffs)
+  const cv::Mat & dist_coeffs,
+  double error_correction_rate = 0.6)
 {
   if (dictionaries.size() != marker_sizes.size()) {
     throw std::invalid_argument(
@@ -186,6 +187,8 @@ inline DetectionResult detectMultiDictMarkers(
 
   DetectionResult result;
   cv::Ptr<cv::aruco::DetectorParameters> params = cv::aruco::DetectorParameters::create();
+  // Higher rate tolerates more bit errors, i.e. accepts lower-confidence markers.
+  params->errorCorrectionRate = error_correction_rate;
 
   for (size_t d = 0; d < dictionaries.size(); ++d) {
     int dict_id = dictionaryFromString(dictionaries[d]);
@@ -236,6 +239,11 @@ struct ZoomConfig
   double height{500.0};         // crop height px
   double upscale{1.5};          // upscale factor applied to the crop
   bool rescale_distortion{false};  // undistort the crop before detection when true
+  double contrast_alpha{1.0};   // contrast gain applied to the crop (1.0 => unchanged)
+  double contrast_beta{0.0};    // brightness offset applied to the crop (0 => unchanged)
+  bool glare_reduction_enabled{false};  // CLAHE on the crop's L channel before the contrast stretch
+  double glare_clip_limit{2.0};   // CLAHE clip limit; higher allows more local contrast (and glare) through
+  int glare_tile_grid_size{8};    // CLAHE tile grid size (NxN); smaller tiles localize glare suppression more
 };
 
 /** Detect markers on a virtually cropped + upscaled region.
@@ -255,7 +263,8 @@ inline DetectionResult detectMultiDictMarkersZoomed(
   const cv::Mat & camera_matrix,
   const cv::Mat & dist_coeffs,
   const ZoomConfig & zoom,
-  cv::Mat * debug_image = nullptr)
+  cv::Mat * debug_image = nullptr,
+  double error_correction_rate = 0.6)
 {
   const double fx = camera_matrix.at<double>(0, 0);
   const double fy = camera_matrix.at<double>(1, 1);
@@ -296,13 +305,31 @@ inline DetectionResult detectMultiDictMarkersZoomed(
   // Upscale the crop and its intrinsics
   cv::Mat scaled;
   cv::resize(crop, scaled, cv::Size(), scale, scale, cv::INTER_CUBIC);
+  // Glare reduction: CLAHE on the L channel caps local contrast gain per tile, so
+  // blown-out specular spots aren't amplified further while washed-out (but not
+  // fully saturated) regions regain detail the marker detector can threshold on.
+  if (zoom.glare_reduction_enabled) {
+    cv::Mat lab;
+    cv::cvtColor(scaled, lab, cv::COLOR_BGR2Lab);
+    std::vector<cv::Mat> lab_planes;
+    cv::split(lab, lab_planes);
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(
+      zoom.glare_clip_limit, cv::Size(zoom.glare_tile_grid_size, zoom.glare_tile_grid_size));
+    clahe->apply(lab_planes[0], lab_planes[0]);
+    cv::merge(lab_planes, lab);
+    cv::cvtColor(lab, scaled, cv::COLOR_Lab2BGR);
+  }
+  // Optional contrast/brightness stretch to make a faint small marker stand out.
+  if (zoom.contrast_alpha != 1.0 || zoom.contrast_beta != 0.0) {
+    scaled.convertTo(scaled, -1, zoom.contrast_alpha, zoom.contrast_beta);
+  }
   adj_cam.at<double>(0, 0) = fx * scale;
   adj_cam.at<double>(1, 1) = fy * scale;
   adj_cam.at<double>(0, 2) = adj_cam.at<double>(0, 2) * scale;
   adj_cam.at<double>(1, 2) = adj_cam.at<double>(1, 2) * scale;
 
   DetectionResult result = detectMultiDictMarkers(
-    scaled, dictionaries, marker_sizes, adj_cam, adj_dist);
+    scaled, dictionaries, marker_sizes, adj_cam, adj_dist, error_correction_rate);
 
   // Build the zoomed debug visualization (in upscaled-crop coordinates) before remap
   if (debug_image != nullptr) {

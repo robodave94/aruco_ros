@@ -36,6 +36,7 @@
 #include "aruco_msgs/msg/marker.hpp"
 #include "aruco_msgs/msg/marker_array.hpp"
 #include "aruco_ros_cv/aruco_cv_utils.hpp"
+#include "aruco_ros_cv/pose_filter.hpp"
 
 class ArucoRtCaptureNode : public rclcpp::Node
 {
@@ -49,6 +50,11 @@ public:
     this->declare_parameter<std::vector<double>>("marker_sizes", {0.05});
     this->declare_parameter<std::string>("camera_info_topic", "/camera/camera_info");
     this->declare_parameter<std::string>("reference_frame", "");
+    this->declare_parameter<bool>("smoothing_enabled", true);
+    this->declare_parameter<int>("smoothing_window", 10);
+    this->declare_parameter<std::string>("smoothing_type", "moving_average");
+    this->declare_parameter<double>("smoothing_ema_alpha", 0.3);
+    this->declare_parameter<double>("smoothing_reset_timeout", 0.5);
 
     // Get parameters
     image_topic_ = this->get_parameter("image_topic").as_string();
@@ -56,6 +62,20 @@ public:
     marker_sizes_ = this->get_parameter("marker_sizes").as_double_array();
     camera_info_topic_ = this->get_parameter("camera_info_topic").as_string();
     reference_frame_ = this->get_parameter("reference_frame").as_string();
+
+    aruco_ros_cv::PoseFilterConfig smoothing;
+    smoothing.enabled = this->get_parameter("smoothing_enabled").as_bool();
+    smoothing.type =
+      aruco_ros_cv::smoothingTypeFromString(this->get_parameter("smoothing_type").as_string());
+    {
+      const int win = static_cast<int>(this->get_parameter("smoothing_window").as_int());
+      smoothing.window = (win > 0) ? win : 10;
+      const double a = this->get_parameter("smoothing_ema_alpha").as_double();
+      smoothing.ema_alpha = (a > 0.0 && a <= 1.0) ? a : 0.3;
+      const double rt = this->get_parameter("smoothing_reset_timeout").as_double();
+      smoothing.reset_timeout = (rt > 0.0) ? rt : 0.5;
+    }
+    pose_filter_.configure(smoothing);
 
     if (dictionaries_.size() != marker_sizes_.size()) {
       RCLCPP_ERROR(this->get_logger(), "dictionaries and marker_sizes must have equal length");
@@ -117,6 +137,7 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  aruco_ros_cv::PoseFilter pose_filter_;
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_info_sub_;
@@ -162,6 +183,9 @@ private:
         "Detection error: %s", e.what());
       return;
     }
+
+    // Smooth pose/orientation/corners in place before visualization/publish/TF.
+    pose_filter_.apply(det, rclcpp::Time(msg->header.stamp).seconds());
 
     auto stamp = msg->header.stamp;
 

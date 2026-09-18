@@ -21,6 +21,9 @@
     <arg name="detection_id" default=""
          description="Optional id for this detection (default: auto-generated from dictionaries)"/>
 
+    <arg name="marker_ids" default="[]"
+         description="Marker ids to keep after detection; empty => accept all ids"/>
+
     <arg name="reference_frame" default=""
          description="TF parent frame for broadcast marker transforms (empty => image frame_id)"/>
 
@@ -37,6 +40,18 @@
          description="Undistort the crop before detection (default false)"/>
     <arg name="zoom_debug_enabled" default="false"
          description="Also publish the upscaled-crop debug feed (default false)"/>
+    <arg name="zoom_contrast_alpha" default="1.0"
+         description="Contrast gain on the zoom crop (1.0 => unchanged)"/>
+    <arg name="zoom_contrast_beta" default="0.0"
+         description="Brightness offset on the zoom crop (0 => unchanged)"/>
+    <arg name="zoom_glare_reduction_enabled" default="false"
+         description="CLAHE-based glare reduction on the zoom crop, applied before the contrast stretch"/>
+    <arg name="zoom_glare_clip_limit" default="2.0"
+         description="CLAHE clip limit; higher allows more local contrast (and glare) through"/>
+    <arg name="zoom_glare_tile_grid_size" default="8"
+         description="CLAHE tile grid size (NxN); smaller tiles localize glare suppression more"/>
+    <arg name="error_correction_rate" default="0.6"
+         description="ArUco bit-error tolerance; higher accepts lower-confidence markers"/>
 
     <node pkg="aruco_ros_cv" exec="aruco_start_detection"
           name="aruco_start_detection" output="screen">
@@ -46,6 +61,7 @@
         <param name="marker_sizes" value="$(var marker_sizes)"/>
         <param name="camera_params_file" value="$(var camera_params_file)"/>
         <param name="detection_id" value="$(var detection_id)"/>
+        <param name="marker_ids" value="$(var marker_ids)"/>
         <param name="reference_frame" value="$(var reference_frame)"/>
         <param name="zoom_enabled" value="$(var zoom_enabled)"/>
         <param name="zoom_center_x" value="$(var zoom_center_x)"/>
@@ -55,5 +71,11 @@
         <param name="zoom_upscale" value="$(var zoom_upscale)"/>
         <param name="zoom_rescale_distortion" value="$(var zoom_rescale_distortion)"/>
         <param name="zoom_debug_enabled" value="$(var zoom_debug_enabled)"/>
+        <param name="zoom_contrast_alpha" value="$(var zoom_contrast_alpha)"/>
+        <param name="zoom_contrast_beta" value="$(var zoom_contrast_beta)"/>
+        <param name="zoom_glare_reduction_enabled" value="$(var zoom_glare_reduction_enabled)"/>
+        <param name="zoom_glare_clip_limit" value="$(var zoom_glare_clip_limit)"/>
+        <param name="zoom_glare_tile_grid_size" value="$(var zoom_glare_tile_grid_size)"/>
+        <param name="error_correction_rate" value="$(var error_correction_rate)"/>
     </node>
 </launch>

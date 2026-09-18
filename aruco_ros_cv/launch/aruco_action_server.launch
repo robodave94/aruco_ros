@@ -7,8 +7,19 @@
     <arg name="max_processing_threads" default="10"
          description="Max concurrent per-camera-topic detection threads"/>
 
+    <arg name="die_on_node_exit" default="false"
+         description="Shut the whole launch down if this node exits (startup-failure guard)"/>
+
+    <!-- on_exit is compared as a literal at parse time, so it cannot be substituted; -->
+    <!-- the node is duplicated to gate the fail-kill behaviour on die_on_node_exit.  -->
     <node pkg="aruco_ros_cv" exec="aruco_action_server"
-          name="aruco_action_server" namespace="$(var ns)" output="screen">
+          name="aruco_action_server" namespace="$(var ns)" output="screen"
+          on_exit="shutdown" if="$(var die_on_node_exit)">
+        <param name="max_processing_threads" value="$(var max_processing_threads)"/>
+    </node>
+    <node pkg="aruco_ros_cv" exec="aruco_action_server"
+          name="aruco_action_server" namespace="$(var ns)" output="screen"
+          unless="$(var die_on_node_exit)">
         <param name="max_processing_threads" value="$(var max_processing_threads)"/>
     </node>
 </launch>
